@@ -30,7 +30,13 @@ DEFAULT_JOB: dict[str, Any] = {
     "end_id": 0,
     "next_id": 1,
     "copied": 0,
+    "deleted": 0,
     "skipped": 0,
+    # Operation is "copy" or "delete". A delete job stores one selected
+    # configured channel only; it is created only after inline confirmation.
+    "operation": "copy",
+    "delete_channel": "",
+    "delete_role": "",
     "started_at": 0.0,
     "updated_at": 0.0,
     "error": "",

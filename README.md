@@ -31,6 +31,9 @@ pinned: false
 
 ## ✨ Highlights
 
+> [!NOTE]
+> **Optional delete range behavior:** choose **🗑 Use Copy Range** to delete the currently saved copy range, or choose **🎯 Custom Range** to override it for one delete action. A bounded final range and confirmation are always required.
+
 - 📦 Copies old channel **media posts** from a chosen source range into a target channel.
 - 🕶️ Uses MTProto forwarding with original-author attribution removed where Telegram permits it.
 - 🧭 One editable private-message card for setup, progress, pause, errors, and completion.
@@ -40,6 +43,7 @@ pinned: false
 - 🔒 Owner-only controls: other users cannot run migrations or edit setup.
 - 🕒 Application logs use **Sri Lanka Standard Time** (`SLST`, `Asia/Colombo`).
 - 🧩 Supports public usernames, private channel IDs, and Telegram post links.
+- 🗑️ Deletes messages from one selected channel with an optional custom range, final confirmation, and safe default copy range.
 - ☁️ Runs on a Hugging Face Docker Space or locally on Android Termux.
 
 ---
@@ -49,11 +53,12 @@ pinned: false
 1. The bot runs using **Pyrogram + MTProto** with your bot token and Telegram API credentials.
 2. You open the bot’s private chat and send `/start`.
 3. One control card appears. Use inline buttons to set or change source, target, range, test file, and speed.
-4. Use the single **🗑 Clear** button after choosing a source, target, or range. It clears the last chosen field directly; tap it before choosing a field to select exactly what to clear. Each clear action resets saved copy counters safely.
+4. Use **🗑 Source**, **🗑 Target**, or **🗑 Range** when a migration is done or you want to reuse the bot for another channel. Each clear action resets saved copy counters safely.
 5. The bot checks one media post with **🧪 Test**.
 6. Tap **▶️ Start**. The same card updates while copying.
 6. Telegram may temporarily throttle forwarding. The app waits automatically and continues.
-7. When the range finishes, the card changes to **✅ COMPLETE**.
+7. Use **🗑 Delete Messages** only when needed: choose one channel, use the saved copy range or optionally set a custom range, then confirm.
+8. When the range finishes, the card changes to **✅ COMPLETE**.
 
 ### Panel preview
 
@@ -78,12 +83,31 @@ Open **⚙️ Setup** from the panel. All setup actions stay inside the same edi
 | 📥 Source | Set or replace the old/source channel |
 | 📤 Target | Set or replace the new/target channel |
 | 🎯 Range | Set or replace the start and end message IDs |
-| 🗑 Source / 🗑 Target / 🗑 Range | One context-aware bin button. After you save a field, it clears that field directly. Before a field is chosen, tap **🗑 Clear** to select source, target, or range. |
+| 🗑 Delete Messages | Choose one channel and delete a confirmed, bounded message range |
+| 🗑 Source | Clear only the saved source channel |
+| 🗑 Target | Clear only the saved target channel |
+| 🗑 Range | Clear only the saved message range back to `1 → 0` |
 
 > [!TIP]
-> The bot uses one active PM control card. Setup prompts, saved values, test results, running progress, pause, errors, and completion edit that same card; the bot does not send progress-message spam. The owner’s typed setup values and commands are deleted when Telegram allows it.
-
 > Clear buttons are available only while no copy task is running. Pause the task first, then change or clear its setup.
+
+### 🗑 Delete messages safely
+
+The delete tool works on **one selected channel at a time**. It uses the same one private control card and requires final confirmation.
+
+1. Open **⚙️ Setup** → **🗑 Delete Messages**.
+2. Choose **📥 Source** or **📤 Target**.
+3. Choose one option:
+   - **🗑 Use Copy Range** — uses the already-saved main copy range; no extra delete range is required.
+   - **🎯 Custom Range** — optional override for this deletion only. Send `<START_MESSAGE_ID> <END_MESSAGE_ID>`.
+4. Review the selected channel, final range, and message count.
+5. Press **🗑 CONFIRM DELETE**. The same card becomes the delete-progress card.
+
+> [!IMPORTANT]
+> The custom delete range is optional, but deletion is always bounded. When you skip Custom Range, the bot uses the saved **Copy Range**. It never deletes an entire channel without a final message ID.
+
+> [!CAUTION]
+> Deleted messages cannot be restored. The bot needs **Delete Messages** administrator permission in the selected channel. **✕ Cancel** is available on every temporary delete screen.
 
 ---
 
@@ -97,6 +121,7 @@ Before starting, add the bot to both channels:
 |---|---|
 | 📥 Source channel | The bot must be an **Administrator** and able to access the posts you want to copy. |
 | 📤 Target channel | The bot must be an **Administrator** with permission to **post messages**. |
+| 🗑 Selected delete channel | The bot must be an **Administrator** with permission to **Delete Messages**. |
 | 👤 Owner private chat | Start the bot once, so it can create and update the private control card. |
 
 ### Telegram developer credentials

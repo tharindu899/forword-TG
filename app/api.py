@@ -134,6 +134,54 @@ class BotApi:
     ) -> tuple[bool, dict[str, Any]]:
         return self.copy_messages(target, source, [message_id], should_stop)
 
+    async def _delete_ids(
+        self,
+        channel: str | int,
+        ids: list[int],
+        should_stop: Callable[[], bool],
+    ) -> dict[str, Any]:
+        """Delete explicit IDs from one channel.
+
+        This never enumerates history. The caller supplies an explicit range
+        that was reviewed and confirmed in the owner's private control panel.
+        """
+        if should_stop():
+            return {"stopped": True}
+        try:
+            await self.client.delete_messages(
+                chat_id=self._chat(channel),
+                message_ids=[int(item) for item in ids],
+            )
+        except FloodWait as exc:
+            if not await self._wait_flood(int(exc.value), should_stop):
+                return {"stopped": True}
+            return await self._delete_ids(channel, ids, should_stop)
+        return {"result": [{"message_id": int(item)} for item in ids]}
+
+    def delete_messages(
+        self,
+        channel: str | int,
+        message_ids: Iterable[int],
+        should_stop: Callable[[], bool],
+    ) -> tuple[bool, dict[str, Any]]:
+        ids = [int(item) for item in message_ids]
+        if not ids:
+            return True, {"result": []}
+        ok, data = self._run(self._delete_ids(channel, ids, should_stop), timeout=300)
+        if not ok:
+            return False, data
+        if data.get("stopped"):
+            return False, {"description": "Delete stopped.", "stopped": True}
+        return True, data
+
+    def delete_message(
+        self,
+        channel: str | int,
+        message_id: int,
+        should_stop: Callable[[], bool],
+    ) -> tuple[bool, dict[str, Any]]:
+        return self.delete_messages(channel, [message_id], should_stop)
+
     @staticmethod
     def _chat(chat_id: str | int) -> str | int:
         return int(chat_id) if str(chat_id).lstrip("-").isdigit() else str(chat_id)

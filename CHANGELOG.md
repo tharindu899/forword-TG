@@ -1,11 +1,12 @@
-# ✨ Single-card cleanup + one-bin setup update
-
-- 🧹 The bot now keeps background progress, pause, errors, test results, and completion on **one known PM card**. Background updates never create another card when a card ID is missing or stale.
-- 🔕 `MESSAGE_NOT_MODIFIED` is treated as a normal no-op and no longer produces a warning.
-- 🗑️ Setup has **one context-aware bin button**: after you save Source, Target, or Range it directly clears that last chosen field. Tap generic **🗑 Clear** to choose a different field.
-- 🔁 Pressing any inline button adopts that message as the active panel, so the live copy status continues editing the panel you are using.
-
 # Changelog
+
+## 🎯 Optional delete range
+
+- 🗑 Added **Use Copy Range** after choosing the source or target delete channel.
+- 🎯 Added **Custom Range** as an optional one-time override for deletion.
+- 🔒 Deletion remains bounded and always requires the final **🗑 CONFIRM DELETE** button.
+- ✕ Back and Cancel remain available through each delete step.
+
 
 ## ✨ Clear setup controls
 

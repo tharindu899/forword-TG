@@ -44,6 +44,16 @@ class PendingInput:
     panel_id: int
 
 
+@dataclass
+class PendingDelete:
+    """One reviewed delete action waiting for the final red confirmation tap."""
+
+    role: str
+    start_id: int
+    end_id: int
+    panel_id: int
+
+
 class ControlBot:
     """Runs one editable owner-PM card: setup, controls, and live progress."""
 
@@ -71,6 +81,7 @@ class ControlBot:
         self._stop = asyncio.Event()
         self._menu_task: asyncio.Task[Any] | None = None
         self._pending: dict[int, PendingInput] = {}
+        self._delete_pending: dict[int, PendingDelete] = {}
 
     def owner_id(self) -> int:
         return self.configured_owner_id or self.store.get_owner_id()
@@ -261,23 +272,27 @@ class ControlBot:
             return InlineKeyboardButton(labels[field], callback_data=f"clear:{field}")
         return InlineKeyboardButton("🗑 Clear", callback_data="clear:choose")
 
+    @staticmethod
+    def _two_column_grid(buttons: list[InlineKeyboardButton]) -> list[list[InlineKeyboardButton]]:
+        """Arrange controls compactly: pairs first, odd final item full width."""
+        rows: list[list[InlineKeyboardButton]] = []
+        for index in range(0, len(buttons), 2):
+            rows.append(buttons[index:index + 2])
+        return rows
+
     def setup_keyboard(self) -> InlineKeyboardMarkup:
-        """Compact one-card setup controls with one context-aware bin button."""
-        return InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("📥 Source", callback_data="input:source"),
-                InlineKeyboardButton("📤 Target", callback_data="input:target"),
-            ],
-            [
-                InlineKeyboardButton("🎯 Range", callback_data="input:range"),
-                InlineKeyboardButton("🧪 Test", callback_data="input:test"),
-            ],
-            [
-                self._clear_button(),
-                InlineKeyboardButton(f"⚡ {self.speed_name()}", callback_data="speed"),
-            ],
-            [InlineKeyboardButton("◀️ Panel", callback_data="status")],
+        """Compact two-column setup grid with a full-width Cancel exit."""
+        rows = self._two_column_grid([
+            InlineKeyboardButton("📥 Source", callback_data="input:source"),
+            InlineKeyboardButton("📤 Target", callback_data="input:target"),
+            InlineKeyboardButton("🎯 Range", callback_data="input:range"),
+            InlineKeyboardButton("🧪 Test", callback_data="input:test"),
+            InlineKeyboardButton("🗑 Delete Messages", callback_data="delete:choose"),
+            InlineKeyboardButton(f"⚡ {self.speed_name()}", callback_data="speed"),
         ])
+        rows.append([self._clear_button()])
+        rows.append([InlineKeyboardButton("✕ Cancel", callback_data="cancel")])
+        return InlineKeyboardMarkup(rows)
 
     def clear_choice_text(self) -> str:
         settings = self.store.settings()
@@ -294,24 +309,24 @@ class ControlBot:
 
     def clear_choice_keyboard(self) -> InlineKeyboardMarkup:
         settings = self.store.settings()
-        buttons: list[list[InlineKeyboardButton]] = []
-        row: list[InlineKeyboardButton] = []
+        choices: list[InlineKeyboardButton] = []
         if settings.get("source_channel"):
-            row.append(InlineKeyboardButton("🗑 Source", callback_data="clear:source"))
+            choices.append(InlineKeyboardButton("🗑 Source", callback_data="clear:source"))
         if settings.get("target_channel"):
-            row.append(InlineKeyboardButton("🗑 Target", callback_data="clear:target"))
-        if row:
-            buttons.append(row)
+            choices.append(InlineKeyboardButton("🗑 Target", callback_data="clear:target"))
         try:
             has_range = int(settings.get("range_end") or 0) >= int(settings.get("range_start") or 1)
         except ValueError:
             has_range = False
         if has_range:
-            buttons.append([InlineKeyboardButton("🗑 Range", callback_data="clear:range")])
-        if not buttons:
-            buttons.append([InlineKeyboardButton("ℹ️ Nothing saved", callback_data="clear:back")])
-        buttons.append([InlineKeyboardButton("◀️ Setup", callback_data="clear:back")])
-        return InlineKeyboardMarkup(buttons)
+            choices.append(InlineKeyboardButton("🗑 Range", callback_data="clear:range"))
+
+        if not choices:
+            rows = [[InlineKeyboardButton("ℹ️ Nothing saved", callback_data="clear:back")]]
+        else:
+            rows = self._two_column_grid(choices)
+        rows.append([InlineKeyboardButton("✕ Cancel", callback_data="cancel")])
+        return InlineKeyboardMarkup(rows)
 
     def speed_text(self) -> str:
         return self.symbol_panel(
@@ -332,7 +347,7 @@ class ControlBot:
                 InlineKeyboardButton("⚖️ Balanced", callback_data="speed:balanced"),
             ],
             [InlineKeyboardButton("🚀 Fast", callback_data="speed:fast")],
-            [InlineKeyboardButton("◀️ Setup", callback_data="setup")],
+            [InlineKeyboardButton("✕ Cancel", callback_data="cancel")],
         ])
 
     def input_text(self, action: str, error: str = "") -> str:
@@ -348,6 +363,124 @@ class ControlBot:
 
     def input_keyboard(self) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup([[InlineKeyboardButton("✕ Cancel", callback_data="input:cancel")]])
+
+    def delete_choice_text(self) -> str:
+        settings = self.store.settings()
+        rows = [
+            "⚠️ <b>Permanent action</b>  •  cannot be undone",
+            f"📥 Source  <code>{self._short(settings['source_channel'], 28)}</code>",
+            f"📤 Target  <code>{self._short(settings['target_channel'], 28)}</code>",
+            "🔒 Bot needs <b>Delete Messages</b> admin permission in the selected channel.",
+        ]
+        return self.symbol_panel("DELETE MESSAGES", rows, "Choose exactly one channel. You will review the range before deletion starts.")
+
+    def delete_choice_keyboard(self) -> InlineKeyboardMarkup:
+        settings = self.store.settings()
+        choices: list[InlineKeyboardButton] = []
+        if settings.get("source_channel"):
+            choices.append(InlineKeyboardButton("📥 Source", callback_data="delete:source"))
+        if settings.get("target_channel"):
+            choices.append(InlineKeyboardButton("📤 Target", callback_data="delete:target"))
+        rows = self._two_column_grid(choices) if choices else [
+            [InlineKeyboardButton("⚠️ Set a channel first", callback_data="delete:cancel")]
+        ]
+        rows.append([InlineKeyboardButton("✕ Cancel", callback_data="delete:cancel")])
+        return InlineKeyboardMarkup(rows)
+
+    def configured_copy_range(self) -> tuple[int, int] | None:
+        """Return the saved copy range when it is valid.
+
+        The delete flow deliberately treats this as a safe default. A custom
+        delete range is optional, but deletion is always bounded: when no
+        custom range is supplied, the currently configured copy range is used.
+        """
+        settings = self.store.settings()
+        start_id = self.parse_message_id(str(settings.get("range_start", "")))
+        end_id = self.parse_message_id(str(settings.get("range_end", "")))
+        if start_id and end_id and start_id >= 1 and end_id >= start_id:
+            return start_id, end_id
+        return None
+
+    def delete_options_text(self, role: str, error: str = "") -> str:
+        channel = self.store.settings().get(f"{role}_channel", "")
+        copy_range = self.configured_copy_range()
+        range_line = (
+            f"📌 Copy range  <code>{copy_range[0]:,} → {copy_range[1]:,}</code>"
+            if copy_range else
+            "📌 Copy range  <code>not set</code>"
+        )
+        rows = [
+            f"🧹 Channel  <b>{role.title()}</b>  <code>{self._short(channel, 28)}</code>",
+            "🎯 Custom delete range  <b>optional</b>",
+            range_line,
+            "⚠️ Deletion is permanent. A final confirmation is always required.",
+        ]
+        note = error or (
+            "Use the saved copy range, or set a custom delete range. "
+            "The bot never deletes an unbounded channel."
+        )
+        return self.symbol_panel("DELETE OPTIONS", rows, note)
+
+    def delete_options_keyboard(self, role: str) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🎯 Custom Range", callback_data=f"delete:range:{role}"),
+                InlineKeyboardButton("🗑 Use Copy Range", callback_data=f"delete:default:{role}"),
+            ],
+            [
+                InlineKeyboardButton("◀️ Back", callback_data="delete:choose"),
+                InlineKeyboardButton("✕ Cancel", callback_data="delete:cancel"),
+            ],
+        ])
+
+    def delete_range_text(self, role: str, error: str = "") -> str:
+        channel = self.store.settings().get(f"{role}_channel", "")
+        copy_range = self.configured_copy_range()
+        default_line = (
+            f"📌 Saved copy range  <code>{copy_range[0]:,} → {copy_range[1]:,}</code>"
+            if copy_range else
+            "📌 Saved copy range  <code>not set</code>"
+        )
+        rows = [
+            f"🧹 Channel  <b>{role.title()}</b>  <code>{self._short(channel, 28)}</code>",
+            default_line,
+            "✍️ Send <b>start</b> and <b>end</b> message IDs to override it.",
+        ]
+        return self.symbol_panel(
+            "CUSTOM DELETE RANGE",
+            rows,
+            error or "Optional. Use ◀️ Back to use the saved copy range instead.",
+        )
+
+    def delete_confirm_text(self, pending: PendingDelete) -> str:
+        total = pending.end_id - pending.start_id + 1
+        channel = self.store.settings().get(f"{pending.role}_channel", "")
+        rows = [
+            f"🧹 Channel  <b>{pending.role.title()}</b>  <code>{self._short(channel, 28)}</code>",
+            f"🎯 Range  <code>{pending.start_id:,} → {pending.end_id:,}</code>",
+            f"🧮 Total  <b>{total:,}</b> messages",
+            "⚠️ <b>This cannot be undone.</b>",
+        ]
+        return self.symbol_panel("CONFIRM DELETE", rows, "Press the red button only when this channel and range are correct.")
+
+    @staticmethod
+    def delete_range_keyboard(role: str) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("◀️ Options", callback_data=f"delete:options:{role}"),
+                InlineKeyboardButton("✕ Cancel", callback_data="delete:cancel"),
+            ],
+        ])
+
+    @staticmethod
+    def delete_confirm_keyboard() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 CONFIRM DELETE", callback_data="delete:confirm")],
+            [
+                InlineKeyboardButton("◀️ Change", callback_data="delete:choose"),
+                InlineKeyboardButton("✕ Cancel", callback_data="delete:cancel"),
+            ],
+        ])
 
     # ------------------------------------------------------------------
     # Owner/auth and silent helpers
@@ -499,12 +632,18 @@ class ControlBot:
             await query.answer("Owner only.", show_alert=True)
             return
         data = query.data or ""
-        # Any pressed inline button becomes the one active status card. This lets
-        # the app keep editing the current card instead of sending a replacement.
         if query.message:
             await asyncio.to_thread(self.controller.adopt_status_card, user_id, int(query.message.id))
 
-        if data == "status" or data == "home":
+        # Global return / cancel: clears transient prompts only and edits the
+        # same control card back to the normal panel.
+        if data in {"cancel", "input:cancel", "delete:cancel"}:
+            self._pending.pop(user_id, None)
+            self._delete_pending.pop(user_id, None)
+            await query.answer("Cancelled")
+            await self.edit_panel(query, self.setup_text("✕ Cancelled."), self.setup_keyboard())
+            return
+        if data in {"status", "home"}:
             await query.answer("Panel refreshed")
             await asyncio.to_thread(self.controller.publish_status)
             return
@@ -513,6 +652,9 @@ class ControlBot:
             await self.edit_panel(query, self.setup_text(), self.setup_keyboard())
             return
         if data == "speed":
+            if not query.message or not await self.ensure_not_running(int(query.message.id), user_id):
+                await query.answer("Pause the task before changing speed.", show_alert=True)
+                return
             await query.answer()
             await self.edit_panel(query, self.speed_text(), self.speed_keyboard())
             return
@@ -527,7 +669,7 @@ class ControlBot:
             return
         if data == "start":
             ok, text = await self.start_or_resume()
-            await query.answer("Copy started" if ok else text[:180], show_alert=not ok)
+            await query.answer("Task started" if ok else text[:180], show_alert=not ok)
             return
         if data == "pause":
             ok, text = await self.pause_job()
@@ -537,11 +679,8 @@ class ControlBot:
             self.queue_menu_sync(force=True)
             await query.answer("Menu refresh started")
             return
-        if data == "input:cancel":
-            self._pending.pop(user_id, None)
-            await query.answer("Cancelled")
-            await self.edit_panel(query, self.setup_text(), self.setup_keyboard())
-            return
+
+        # Clear setup values. No task may be active while values are changed.
         if data == "clear:choose":
             if not query.message:
                 await query.answer("Open Setup first.", show_alert=True)
@@ -566,12 +705,111 @@ class ControlBot:
                 return
             self.clear_setup_field(field)
             await query.answer(f"{field.title()} cleared")
-            await self.edit_panel(
-                query,
-                self.setup_text(f"🗑 {field.title()} cleared. Set a new value when ready."),
-                self.setup_keyboard(),
-            )
+            await self.edit_panel(query, self.setup_text(f"🗑 {field.title()} cleared."), self.setup_keyboard())
             return
+
+        # Delete workflow: selected channel -> optional custom range or saved copy range -> explicit red confirmation.
+        if data == "delete:choose":
+            if not query.message:
+                await query.answer("Open Setup first.", show_alert=True)
+                return
+            if not await self.ensure_not_running(int(query.message.id), user_id):
+                await query.answer("Pause the active task before deleting.", show_alert=True)
+                return
+            self._pending.pop(user_id, None)
+            self._delete_pending.pop(user_id, None)
+            await query.answer()
+            await self.edit_panel(query, self.delete_choice_text(), self.delete_choice_keyboard())
+            return
+        if data in {"delete:source", "delete:target"}:
+            if not query.message:
+                await query.answer("Open Setup first.", show_alert=True)
+                return
+            if not await self.ensure_not_running(int(query.message.id), user_id):
+                await query.answer("Pause the active task before deleting.", show_alert=True)
+                return
+            role = data.split(":", 1)[1]
+            self._delete_pending.pop(user_id, None)
+            await query.answer()
+            await self.edit_panel(query, self.delete_options_text(role), self.delete_options_keyboard(role))
+            return
+        if data.startswith("delete:options:"):
+            if not query.message:
+                await query.answer("Open Setup first.", show_alert=True)
+                return
+            role = data.split(":", 2)[2]
+            if role not in {"source", "target"}:
+                await query.answer("Unknown delete channel.", show_alert=True)
+                return
+            if not await self.ensure_not_running(int(query.message.id), user_id):
+                await query.answer("Pause the active task before deleting.", show_alert=True)
+                return
+            self._delete_pending.pop(user_id, None)
+            await query.answer()
+            await self.edit_panel(query, self.delete_options_text(role), self.delete_options_keyboard(role))
+            return
+        if data.startswith("delete:range:"):
+            if not query.message:
+                await query.answer("Open Setup first.", show_alert=True)
+                return
+            role = data.split(":", 2)[2]
+            if role not in {"source", "target"}:
+                await query.answer("Unknown delete channel.", show_alert=True)
+                return
+            if not await self.ensure_not_running(int(query.message.id), user_id):
+                await query.answer("Pause the active task before deleting.", show_alert=True)
+                return
+            self._delete_pending.pop(user_id, None)
+            self._pending[user_id] = PendingInput(action=f"delete_range:{role}", panel_id=int(query.message.id))
+            await query.answer("Send a custom range")
+            await self.edit_panel(query, self.delete_range_text(role), self.delete_range_keyboard(role))
+            return
+        if data.startswith("delete:default:"):
+            if not query.message:
+                await query.answer("Open Setup first.", show_alert=True)
+                return
+            role = data.split(":", 2)[2]
+            if role not in {"source", "target"}:
+                await query.answer("Unknown delete channel.", show_alert=True)
+                return
+            if not await self.ensure_not_running(int(query.message.id), user_id):
+                await query.answer("Pause the active task before deleting.", show_alert=True)
+                return
+            configured_range = self.configured_copy_range()
+            if not configured_range:
+                await query.answer("Set a copy range or choose Custom Range.", show_alert=True)
+                await self.edit_panel(query, self.delete_options_text(role, "⚠️ No saved copy range. Set a custom delete range."), self.delete_options_keyboard(role))
+                return
+            start_id, end_id = configured_range
+            self._delete_pending[user_id] = PendingDelete(
+                role=role,
+                start_id=start_id,
+                end_id=end_id,
+                panel_id=int(query.message.id),
+            )
+            await query.answer("Using saved copy range")
+            await self.edit_panel(query, self.delete_confirm_text(self._delete_pending[user_id]), self.delete_confirm_keyboard())
+            return
+        if data == "delete:confirm":
+            pending = self._delete_pending.get(user_id)
+            if not pending or not query.message:
+                await query.answer("Delete confirmation expired. Choose the channel again.", show_alert=True)
+                await self.edit_panel(query, self.delete_choice_text(), self.delete_choice_keyboard())
+                return
+            if not await self.ensure_not_running(int(query.message.id), user_id):
+                await query.answer("Pause the active task before deleting.", show_alert=True)
+                return
+            ok, text = await asyncio.to_thread(
+                self.controller.start_delete, pending.role, pending.start_id, pending.end_id
+            )
+            if ok:
+                self._delete_pending.pop(user_id, None)
+                await query.answer("Deletion started")
+            else:
+                await query.answer(text[:180], show_alert=True)
+                await self.edit_panel(query, self.delete_confirm_text(pending), self.delete_confirm_keyboard())
+            return
+
         if data.startswith("input:"):
             action = data.split(":", 1)[1]
             await self.ask_for_input(query, action)
@@ -585,6 +823,7 @@ class ControlBot:
         if not await self.ensure_not_running(int(query.message.id), int(query.from_user.id)):
             await query.answer("Pause task before editing.", show_alert=True)
             return
+        self._delete_pending.pop(int(query.from_user.id), None)
         self._pending[int(query.from_user.id)] = PendingInput(action=action, panel_id=int(query.message.id))
         await query.answer("Send one reply")
         await self.edit_panel(query, self.input_text(action), self.input_keyboard())
@@ -610,6 +849,31 @@ class ControlBot:
 
     async def apply_input(self, user_id: int, pending: PendingInput, raw: str) -> None:
         action = pending.action
+        if action.startswith("delete_range:"):
+            role = action.split(":", 1)[1]
+            values = [self.parse_message_id(part) for part in re.split(r"[\s,\-]+", raw.strip()) if part]
+            if role not in {"source", "target"} or len(values) != 2 or not all(values) or int(values[0]) < 1 or int(values[1]) < int(values[0]):
+                await self.edit_panel_by_id(
+                    user_id, pending.panel_id,
+                    self.delete_range_text(role if role in {"source", "target"} else "source", "⚠️ Use two IDs: 100 250"),
+                    self.delete_range_keyboard(role if role in {"source", "target"} else "source"),
+                )
+                self._pending[user_id] = pending
+                return
+            start_id, end_id = int(values[0]), int(values[1])
+            self._delete_pending[user_id] = PendingDelete(
+                role=role,
+                start_id=start_id,
+                end_id=end_id,
+                panel_id=pending.panel_id,
+            )
+            await self.edit_panel_by_id(
+                user_id, pending.panel_id,
+                self.delete_confirm_text(self._delete_pending[user_id]),
+                self.delete_confirm_keyboard(),
+            )
+            return
+
         if action in {"source", "target"}:
             value = self.parse_channel_reference(raw)
             if not value:
@@ -641,14 +905,14 @@ class ControlBot:
                 )
                 self._pending[user_id] = pending
                 return
-            start, end = int(values[0]), int(values[1])
-            self.store.set("range_start", start)
-            self.store.set("range_end", end)
+            start_id, end_id = int(values[0]), int(values[1])
+            self.store.set("range_start", start_id)
+            self.store.set("range_end", end_id)
             self.store.set("last_clear_field", "range")
-            self.store.reset_job(start, end)
+            self.store.reset_job(start_id, end_id)
             await self.edit_panel_by_id(
                 user_id, pending.panel_id,
-                self.setup_text(f"✅ Range saved: <code>{start:,} → {end:,}</code>"),
+                self.setup_text(f"✅ Range saved: <code>{start_id:,} → {end_id:,}</code>"),
                 self.setup_keyboard(),
             )
             return
@@ -663,9 +927,8 @@ class ControlBot:
                 )
                 self._pending[user_id] = pending
                 return
-            ok, text = await asyncio.to_thread(self.controller.test_copy, msg_id)
-            note = text.replace("✅ ", "✅ ").replace("❌ ", "❌ ")
-            await self.edit_panel_by_id(user_id, pending.panel_id, self.setup_text(note), self.setup_keyboard())
+            _ok, text = await asyncio.to_thread(self.controller.test_copy, msg_id)
+            await self.edit_panel_by_id(user_id, pending.panel_id, self.setup_text(text), self.setup_keyboard())
 
     async def apply_speed_preset(self, preset: str) -> None:
         presets = {

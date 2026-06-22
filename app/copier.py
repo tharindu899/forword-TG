@@ -54,6 +54,10 @@ def is_fatal(description: str) -> bool:
         "forbidden",
         "unauthorized",
         "have no rights",
+        "chat_admin_required",
+        "admin required",
+        "message_delete_forbidden",
+        "delete messages",
     ))
 
 
@@ -148,21 +152,44 @@ class StatusCard:
 
     @staticmethod
     def keyboard(job: dict[str, Any]) -> InlineKeyboardMarkup:
+        """Use compact two-column controls; odd final actions are full width."""
         state = str(job.get("status", "idle")).lower()
+        operation = str(job.get("operation", "copy")).lower()
         if state in {"running", "stopping"}:
-            first = InlineKeyboardButton("⏸ Pause", callback_data="pause")
             return InlineKeyboardMarkup([
-                [first, InlineKeyboardButton("🔄 Refresh", callback_data="status")],
+                [
+                    InlineKeyboardButton("⏸ Pause", callback_data="pause"),
+                    InlineKeyboardButton("🔄 Refresh", callback_data="status"),
+                ],
             ])
+
+        if operation == "delete" and state == "paused":
+            return InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("▶️ Resume Delete", callback_data="start"),
+                    InlineKeyboardButton("⚙️ Setup", callback_data="setup"),
+                ],
+                [InlineKeyboardButton("🔄 Refresh", callback_data="status")],
+            ])
+
+        if operation == "delete" and state in {"completed", "error"}:
+            return InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("🗑 Delete Messages", callback_data="delete:choose"),
+                    InlineKeyboardButton("⚙️ Setup", callback_data="setup"),
+                ],
+                [InlineKeyboardButton("🔄 Refresh", callback_data="status")],
+            ])
+
         start_text = "▶️ Resume" if state == "paused" else "▶️ Start"
         return InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("⚙️ Setup", callback_data="setup"),
-                InlineKeyboardButton("🧪 Test", callback_data="input:test"),
+                InlineKeyboardButton(start_text, callback_data="start"),
             ],
             [
-                InlineKeyboardButton(start_text, callback_data="start"),
-                InlineKeyboardButton("⚡ Speed", callback_data="speed"),
+                InlineKeyboardButton("🧪 Test", callback_data="input:test"),
+                InlineKeyboardButton("🗑 Delete", callback_data="delete:choose"),
             ],
             [InlineKeyboardButton("🔄 Refresh", callback_data="status")],
         ])
@@ -176,6 +203,8 @@ class StatusCard:
     def text(cls, job: dict[str, Any], settings: dict[str, str], title: str | None = None, note: str = "") -> str:
         data = cls.stats(job)
         state = str(job.get("status", "idle")).lower()
+        operation = str(job.get("operation", "copy")).lower()
+        is_delete = operation == "delete"
         state_badges = {
             "running": ("🟢", "RUNNING"),
             "stopping": ("🟠", "PAUSING"),
@@ -194,16 +223,31 @@ class StatusCard:
         target = escape(cls._short(str(settings.get("target_channel") or "not set")))
         speed_name = "Safe" if int(settings.get("batch_size") or 25) <= 12 else ("Fast" if int(settings.get("batch_size") or 25) >= 40 else "Balanced")
 
-        rows = [
-            f"{icon} <b>{label}</b>  •  <code>{percent:.1f}%</code>",
-            f"<code>{bar}</code>  <b>{processed:,} / {total:,}</b>",
-            f"✅ <b>{int(job.get('copied', 0)):,}</b> copied  •  ⏭ <b>{int(job.get('skipped', 0)):,}</b> skipped",
-            f"📥 Next <code>{next_id:,}</code>  •  ⚡ <code>{float(data['speed']):.2f}/s</code>",
-            f"⏳ <code>{format_duration(data['eta'])}</code>  •  🕒 <code>{format_duration(float(data['elapsed']))}</code>",
-            f"🎯 <code>{int(job.get('start_id', 1)):,} → {int(job.get('end_id', 0)):,}</code>  •  ⚡ <code>{speed_name}</code>",
-            f"📥 <code>{source}</code>",
-            f"📤 <code>{target}</code>",
-        ]
+        if is_delete:
+            selected_channel = escape(cls._short(str(job.get("delete_channel") or "not set")))
+            selected_role = escape(str(job.get("delete_role") or "channel").title())
+            rows = [
+                f"{icon} <b>{label}</b>  •  <b>DELETE</b>  •  <code>{percent:.1f}%</code>",
+                f"<code>{bar}</code>  <b>{processed:,} / {total:,}</b>",
+                f"🗑 <b>{int(job.get('deleted', 0)):,}</b> deleted  •  ⏭ <b>{int(job.get('skipped', 0)):,}</b> skipped",
+                f"📥 Next <code>{next_id:,}</code>  •  ⚡ <code>{float(data['speed']):.2f}/s</code>",
+                f"⏳ <code>{format_duration(data['eta'])}</code>  •  🕒 <code>{format_duration(float(data['elapsed']))}</code>",
+                f"🎯 <code>{int(job.get('start_id', 1)):,} → {int(job.get('end_id', 0)):,}</code>  •  ⚡ <code>{speed_name}</code>",
+                f"🧹 <b>{selected_role}</b>  <code>{selected_channel}</code>",
+            ]
+            heading = "CHANNEL DELETE"
+        else:
+            rows = [
+                f"{icon} <b>{label}</b>  •  <code>{percent:.1f}%</code>",
+                f"<code>{bar}</code>  <b>{processed:,} / {total:,}</b>",
+                f"✅ <b>{int(job.get('copied', 0)):,}</b> copied  •  ⏭ <b>{int(job.get('skipped', 0)):,}</b> skipped",
+                f"📥 Next <code>{next_id:,}</code>  •  ⚡ <code>{float(data['speed']):.2f}/s</code>",
+                f"⏳ <code>{format_duration(data['eta'])}</code>  •  🕒 <code>{format_duration(float(data['elapsed']))}</code>",
+                f"🎯 <code>{int(job.get('start_id', 1)):,} → {int(job.get('end_id', 0)):,}</code>  •  ⚡ <code>{speed_name}</code>",
+                f"📥 <code>{source}</code>",
+                f"📤 <code>{target}</code>",
+            ]
+            heading = "CHANNEL COPIER"
         detail = note or str(job.get("note") or job.get("error") or "")
         content = list(rows)
         if detail:
@@ -211,7 +255,7 @@ class StatusCard:
         if not content:
             content.append("ℹ️ No status details available")
 
-        lines = ["▤ <b>CHANNEL COPIER</b>"]
+        lines = [f"▤ <b>{heading}</b>"]
         for index, row in enumerate(content):
             branch = "└" if index == len(content) - 1 else "├"
             lines.append(f"{branch} {row}")
@@ -327,6 +371,7 @@ class CopyWorker:
         job["copied"] = int(job.get("copied", 0)) + copied
         job["skipped"] = int(job.get("skipped", 0)) + skipped
         job["status"] = "running"
+        job["operation"] = "copy"
         job["note"] = ""
         self.store.save_job(job)
         return job
@@ -362,6 +407,10 @@ class CopyWorker:
         card = StatusCard(self.api, self.store, self.config.owner_id)
         job.update({
             "status": "running",
+            "operation": "copy",
+            "deleted": 0,
+            "delete_channel": "",
+            "delete_role": "",
             "start_id": self.config.start_id,
             "end_id": self.config.end_id,
             "error": "",
@@ -458,7 +507,7 @@ class CopyController:
         self.store = store
         self.owner_id = owner_id
         self._lock = threading.RLock()
-        self._worker: CopyWorker | None = None
+        self._worker: Any | None = None
 
     def set_owner_id(self, owner_id: int) -> None:
         with self._lock:
@@ -524,16 +573,109 @@ class CopyController:
     def status_text(self) -> str:
         return StatusCard.text(self.store.job(), self.store.settings())
 
+    def _delete_config(self, role: str, start_id: int, end_id: int, *, resume: bool = False) -> Any:
+        """Build a validated delete worker configuration for exactly one channel."""
+        from .deleter import DeleteConfig
+
+        selected_role = role.strip().lower()
+        if selected_role not in {"source", "target"}:
+            raise ValueError("Choose Source or Target before deleting messages.")
+        if self.owner_id <= 0:
+            raise ValueError("Set OWNER_ID in Hugging Face Space Secrets, then restart the Space.")
+        if int(start_id) < 1 or int(end_id) < int(start_id):
+            raise ValueError("Set a valid delete range first.")
+        settings = self.store.settings()
+        channel = str(settings.get(f"{selected_role}_channel", "")).strip()
+        if not channel:
+            raise ValueError(f"Set the {selected_role} channel before deleting messages.")
+        return DeleteConfig(
+            channel=channel,
+            channel_label=selected_role,
+            start_id=int(start_id),
+            end_id=int(end_id),
+            batch_size=max(1, min(as_int(settings["batch_size"], 25), 100)),
+            delay_seconds=max(0.0, as_float(settings["delay_seconds"], 0.6)),
+            individual_delay_seconds=max(0.0, as_float(settings["individual_delay_seconds"], 0.12)),
+            owner_id=self.owner_id,
+            status_every_ids=max(1, as_int(settings["status_every_ids"], 25)),
+            status_every_seconds=max(5, as_int(settings["status_every_seconds"], 20)),
+        )
+
+    def start_delete(self, role: str, start_id: int, end_id: int) -> tuple[bool, str]:
+        """Start a deletion only after the UI confirmation step has completed."""
+        from .deleter import DeleteWorker
+
+        with self._lock:
+            if self.worker_running():
+                return False, "A task is already running. Pause it before starting deletion."
+            try:
+                config = self._delete_config(role, start_id, end_id)
+            except ValueError as exc:
+                return False, str(exc)
+
+            peer_ok, peer_data = self.api.verify_peer(config.channel)
+            if not peer_ok:
+                return False, self._peer_hint(config.channel_label.title(), str(peer_data.get("description", "Unknown Telegram error")))
+
+            job = self.store.reset_job(config.start_id, config.end_id)
+            job.update({
+                "operation": "delete",
+                "delete_channel": config.channel,
+                "delete_role": config.channel_label,
+                "status": "running",
+                "note": "Confirmed deletion is starting. The same private card will update in place.",
+                "error": "",
+                "interrupted": False,
+            })
+            self.store.save_job(job)
+            self.card().update(job, allow_create=False)
+            self._worker = DeleteWorker(self.api, self.store, config, self._on_finished)
+            self._worker.start()
+            return True, "Deletion started. The same private card will update in place."
+
+    def resume_delete(self) -> tuple[bool, str]:
+        from .deleter import DeleteWorker
+
+        with self._lock:
+            if self.worker_running():
+                return False, "A task is already running. Use Pause first."
+            job = self.store.job()
+            if str(job.get("operation", "copy")) != "delete":
+                return False, "No paused delete task is available."
+            role = str(job.get("delete_role") or "").strip().lower()
+            try:
+                config = self._delete_config(role, int(job.get("start_id", 1)), int(job.get("end_id", 0)), resume=True)
+            except ValueError as exc:
+                return False, str(exc)
+            if str(job.get("delete_channel") or "") != config.channel:
+                return False, "Delete channel was changed. Re-open Delete Messages and confirm a new range."
+
+            job["status"] = "running"
+            job["operation"] = "delete"
+            job["note"] = ""
+            job["error"] = ""
+            job["interrupted"] = False
+            self.store.save_job(job)
+            self.card().update(job, allow_create=False)
+            self._worker = DeleteWorker(self.api, self.store, config, self._on_finished)
+            self._worker.start()
+            return True, "Deletion resumed from the saved next message ID."
+
     def start(self, restart: bool = False) -> tuple[bool, str]:
         with self._lock:
             if self.worker_running():
                 return False, "A copy job is already running. Use the Pause button on the live status card."
+            existing = self.store.job()
+            if str(existing.get("operation", "copy")) == "delete" and str(existing.get("status", "")) == "paused":
+                # The main Start / Resume button must continue a paused delete
+                # task instead of unexpectedly switching back to copy mode.
+                return self.resume_delete()
             try:
                 config = self.current_config()
             except ValueError as exc:
                 return False, str(exc)
 
-            job = self.store.job()
+            job = existing
             same_range = int(job["start_id"]) == config.start_id and int(job["end_id"]) == config.end_id
             if job["status"] == "completed" and same_range and not restart:
                 return False, "This range is complete. Open Setup to choose a new range."
@@ -564,7 +706,7 @@ class CopyController:
                     job["note"] = "No active worker remains. Tap Start / Resume to continue."
                     self.store.save_job(job)
                 self.publish_status(allow_create=False)
-                return False, "No active copy thread is running."
+                return False, "No active task is running."
             self._worker.request_stop()
             job = self.store.job()
             job["status"] = "stopping"
