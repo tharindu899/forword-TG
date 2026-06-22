@@ -1,13 +1,24 @@
-"""Owner-only private command interface for the Render channel copier."""
-
+"""Owner-only compact inline control panel for the Pyrogram channel copier."""
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import re
-import signal
-import threading
-import time
+from dataclasses import dataclass
 from typing import Any
+
+from pyrogram import Client, filters
+from pyrogram.handlers import CallbackQueryHandler, MessageHandler
+from pyrogram.types import (
+    BotCommand,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeChat,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from .api import BotApi
 from .copier import CopyController
@@ -15,388 +26,565 @@ from .store import Store
 
 LOGGER = logging.getLogger(__name__)
 
-COMMANDS = [
-    {"command": "start", "description": "Show channel copier help"},
-    {"command": "help", "description": "Show all commands"},
-    {"command": "menu", "description": "Show command menu and examples"},
-    {"command": "id", "description": "Show your Telegram user ID"},
-    {"command": "claim", "description": "Claim bot if OWNER_ID is empty"},
-    {"command": "owner", "description": "Show current controller owner"},
-    {"command": "appstatus", "description": "Check Render secret setup safely"},
-    {"command": "setsource", "description": "Set old/source channel ID"},
-    {"command": "settarget", "description": "Set new/target channel ID"},
-    {"command": "setrange", "description": "Set START_ID END_ID"},
-    {"command": "setstart", "description": "Set first source message ID"},
-    {"command": "setend", "description": "Set last source message ID"},
-    {"command": "test", "description": "Test copying one old file"},
-    {"command": "copy", "description": "Start the configured range"},
-    {"command": "pause", "description": "Pause safely after current request"},
-    {"command": "resume", "description": "Resume the saved copy job"},
-    {"command": "restart", "description": "Copy the range again from the start"},
-    {"command": "status", "description": "Refresh the single live PM card"},
-    {"command": "config", "description": "Show saved channels and range"},
-    {"command": "setbatch", "description": "Set batch size: 1-100"},
-    {"command": "setdelay", "description": "Set delay after each batch"},
-    {"command": "setinterval", "description": "Set PM update IDs and seconds"},
+# Keep Telegram's visible slash-command menu small. Everything else is in buttons.
+MENU_COMMANDS: list[BotCommand] = [
+    BotCommand("start", "Open or refresh the panel"),
+    BotCommand("copy", "Start or resume copy"),
+    BotCommand("pause", "Pause safely"),
+    BotCommand("status", "Refresh progress"),
 ]
+VISIBLE_COMMAND_NAMES = [item.command for item in MENU_COMMANDS]
+HIDDEN_COMMAND_NAMES = ["claim", "syncmenu"]
+ALL_COMMAND_NAMES = VISIBLE_COMMAND_NAMES + HIDDEN_COMMAND_NAMES
 
-HELP_TEXT = """📦 Channel copier control bot
 
-1) Setup
-/setsource -1001234567890
-/settarget -1001234567890
-/setrange 1 2123
-/test 181
-
-2) Copy
-/copy — start the configured range
-/status — refresh the one live status card
-/pause — save progress safely
-/resume — continue saved work
-/restart — start configured range again
-
-3) Speed
-/setbatch 25 — 1 to 100 IDs per request
-/setdelay 0.6 — seconds after each batch
-/setinterval 25 20 — update card every 25 IDs or 20 seconds
-
-4) Checks
-/config — source, target, range, speed options
-/appstatus — confirms BOT_TOKEN / OWNER_ID / API_ID / API_HASH without showing secrets
-/owner — current controlling user
-/id — your Telegram user ID
-
-Tip: you can paste a private source message link anywhere an ID is accepted. Example: t.me/c/3033186334/181.
-
-The bot cannot list old history. It scans every ID in your range and skips deleted, protected, service, text-only, or non-copyable posts."""
+@dataclass
+class PendingInput:
+    action: str
+    panel_id: int
 
 
 class ControlBot:
+    """Runs one editable owner-PM card: setup, controls, and live progress."""
+
     def __init__(
         self,
+        client: Client,
         api: BotApi,
         store: Store,
         configured_owner_id: int,
         auto_resume: bool,
-        poll_timeout: int,
         *,
         api_id_configured: bool,
         api_hash_configured: bool,
     ) -> None:
+        self.client = client
         self.api = api
         self.store = store
         self.configured_owner_id = configured_owner_id if configured_owner_id > 0 else 0
         self.auto_resume = auto_resume
-        self.poll_timeout = poll_timeout
         self.api_id_configured = api_id_configured
         self.api_hash_configured = api_hash_configured
-        self.stop_event = threading.Event()
-
         if self.configured_owner_id:
-            # Render's explicit OWNER_ID is authoritative after each deploy.
             self.store.set_owner_id(self.configured_owner_id)
         self.controller = CopyController(api, store, self.owner_id())
+        self._stop = asyncio.Event()
+        self._menu_task: asyncio.Task[Any] | None = None
+        self._pending: dict[int, PendingInput] = {}
 
     def owner_id(self) -> int:
         return self.configured_owner_id or self.store.get_owner_id()
 
-    def start(self) -> None:
-        self.api.set_commands(COMMANDS)
-        me = self.api.get_me()
-        LOGGER.info("Connected as @%s (id=%s)", me.get("username", "unknown"), me.get("id", "?"))
+    async def start(self) -> None:
+        self.client.add_handler(
+            MessageHandler(self.on_command, filters.private & filters.command(ALL_COMMAND_NAMES)),
+            group=0,
+        )
+        self.client.add_handler(CallbackQueryHandler(self.on_callback), group=0)
+        self.client.add_handler(
+            MessageHandler(
+                self.on_text_input,
+                filters.private & filters.text & ~filters.command(ALL_COMMAND_NAMES),
+            ),
+            group=1,
+        )
+
+        known_dialogs = await self.prime_peer_cache()
+        me = await self.client.get_me()
+        LOGGER.info("Connected via MTProto as @%s (id=%s)", me.username or "unknown", me.id)
+        LOGGER.info("Peer cache warmed from %s dialog(s); private channel IDs can now be resolved.", known_dialogs)
+        LOGGER.info("Bot transport: Pyrogram MTProto. One-message compact PM panel enabled.")
         LOGGER.info(
             "Secrets: BOT_TOKEN configured; OWNER_ID=%s; API_ID=%s; API_HASH=%s.",
             "set" if self.owner_id() else "not set",
             "set" if self.api_id_configured else "not set",
             "set" if self.api_hash_configured else "not set",
         )
+        self.queue_menu_sync(force=False)
 
         job = self.store.recover_after_restart()
         owner = self.owner_id()
         self.controller.set_owner_id(owner)
         if owner and self.auto_resume and job.get("interrupted"):
-            ok, text = self.controller.start()
+            ok, text = await asyncio.to_thread(self.controller.start)
             LOGGER.info("Auto-resume: %s", text)
             if not ok:
-                self.controller.publish_status()
+                await asyncio.to_thread(self.controller.publish_status)
 
-        while not self.stop_event.is_set():
-            self.poll_once()
+        await self._stop.wait()
+        await asyncio.to_thread(self.controller.request_shutdown_pause)
+        if self._menu_task:
+            self._menu_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._menu_task
 
-        self.controller.request_shutdown_pause()
-        LOGGER.info("Control bot stopped.")
+    async def stop(self) -> None:
+        self._stop.set()
 
-    def stop(self, *_args: Any) -> None:
-        self.stop_event.set()
-        self.controller.request_shutdown_pause()
+    async def prime_peer_cache(self) -> int:
+        """Fetch the bot's dialogs once so Pyrogram stores channel access hashes.
 
-    def poll_once(self) -> None:
-        offset = self.store.get_update_offset()
-        ok, data = self.api.get_updates(offset, self.poll_timeout)
-        if not ok:
-            description = str(data.get("description", "Unknown getUpdates error"))
-            if "conflict" in description.lower():
-                LOGGER.error("Another bot instance is polling this token. Keep only one Render worker running.")
-                time.sleep(10)
-            elif not data.get("stopped"):
-                LOGGER.warning("getUpdates failed: %s", description)
-                time.sleep(3)
-            return
+        MTProto requires an access hash for private channels. A bot may be an
+        administrator already, but a fresh Hugging Face session has no local
+        peer cache until it receives that dialog information.
+        """
+        count = 0
+        try:
+            async for _dialog in self.client.get_dialogs(limit=100):
+                count += 1
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Could not warm peer cache from dialogs: %s", exc)
+        return count
 
-        for update in data.get("result", []):
-            update_id = int(update.get("update_id", 0))
-            try:
-                self.handle_update(update)
-            except Exception:
-                LOGGER.exception("Failed to handle Telegram update %s", update_id)
-            finally:
-                if update_id:
-                    self.store.set_update_offset(update_id + 1)
+    # ------------------------------------------------------------------
+    # Telegram command-menu setup
+    # ------------------------------------------------------------------
+    def queue_menu_sync(self, *, force: bool) -> None:
+        if self._menu_task and not self._menu_task.done():
+            self._menu_task.cancel()
+        self._menu_task = asyncio.create_task(
+            self._register_menu_forever(force=force), name="register-compact-bot-menu"
+        )
 
-    def handle_update(self, update: dict[str, Any]) -> None:
-        message = update.get("message")
-        if not isinstance(message, dict):
-            return
-        chat = message.get("chat") or {}
-        sender = message.get("from") or {}
-        text = str(message.get("text") or "").strip()
-        chat_id = chat.get("id")
-        user_id = sender.get("id")
-        if not isinstance(chat_id, int) or not isinstance(user_id, int) or chat.get("type") != "private":
-            return
-        if not text.startswith("/"):
-            return
-
-        command, args = self.parse_command(text)
-        if command in {"id", "whoami"}:
-            self.reply(chat_id, message, f"Your Telegram user ID: {user_id}")
-            return
-
-        owner = self.owner_id()
-        if not owner:
-            if command == "claim":
-                self.store.set_owner_id(user_id)
-                self.controller.set_owner_id(user_id)
-                self.reply(
-                    chat_id,
-                    message,
-                    "✅ You now own this control bot. Add it as admin in source and target channels, then use /help.",
-                )
-                self.controller.publish_status()
+    async def _set_menu_for_scope(self, label: str, scope: Any | None, *, force: bool) -> tuple[bool, str]:
+        try:
+            if force:
+                if scope is None:
+                    await self.client.delete_bot_commands()
+                else:
+                    await self.client.delete_bot_commands(scope=scope)
+            if scope is None:
+                await self.client.set_bot_commands(MENU_COMMANDS)
             else:
-                self.reply(chat_id, message, "This bot has no owner yet. Send /claim from the account that should control it.")
-            return
+                await self.client.set_bot_commands(MENU_COMMANDS, scope=scope)
+            return True, label
+        except Exception as exc:  # noqa: BLE001
+            return False, f"{label}: {exc}"
 
-        if user_id != owner:
-            return
-        if command == "claim":
-            self.reply(chat_id, message, "This bot is already owned by your account.")
-            return
-        self.handle_owner_command(command, args, chat_id, message)
+    async def _register_menu_forever(self, *, force: bool) -> None:
+        delay = 5
+        while not self._stop.is_set():
+            owner = self.owner_id()
+            scopes: list[tuple[str, Any | None]] = [
+                ("default", None),
+                ("all private chats", BotCommandScopeAllPrivateChats()),
+            ]
+            if owner > 0:
+                scopes.append(("owner private chat", BotCommandScopeChat(chat_id=owner)))
+
+            results = [await self._set_menu_for_scope(label, scope, force=force) for label, scope in scopes]
+            successful = [text for ok, text in results if ok]
+            failed = [text for ok, text in results if not ok]
+            if "all private chats" in successful or "owner private chat" in successful:
+                LOGGER.info(
+                    "Registered compact command menu (%s commands) in: %s.",
+                    len(MENU_COMMANDS), ", ".join(successful),
+                )
+                if failed:
+                    LOGGER.warning("Optional command-menu scope failure: %s", " | ".join(failed))
+                return
+
+            LOGGER.warning(
+                "Command-menu registration did not reach a private-chat scope: %s. Retrying in %ss.",
+                " | ".join(failed) or "unknown error", delay,
+            )
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass
+            delay = min(delay * 2, 60)
+            force = False
+
+    # ------------------------------------------------------------------
+    # Symbol-line visual helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def symbol_panel(title: str, rows: list[str], note: str = "") -> str:
+        """One compact style for every bot card: ▤ header + ├ / └ rows."""
+        content = list(rows)
+        if note:
+            content.append(f"💬 {note}")
+        if not content:
+            content.append("ℹ️ No details available")
+
+        lines = [f"▤ <b>{title}</b>"]
+        for index, row in enumerate(content):
+            branch = "└" if index == len(content) - 1 else "├"
+            lines.append(f"{branch} {row}")
+        return "\n".join(lines)
 
     @staticmethod
-    def parse_command(text: str) -> tuple[str, list[str]]:
-        parts = text.split()
-        head = parts[0].split("@", 1)[0].lower().lstrip("/")
-        return head, parts[1:]
+    def _short(value: str, limit: int = 22) -> str:
+        value = value or "not set"
+        return value if len(value) <= limit else value[: limit - 1] + "…"
 
-    def reply(self, chat_id: int, message: dict[str, Any], text: str) -> None:
-        ok, data = self.api.send_message(chat_id, text, reply_to_message_id=message.get("message_id"))
-        if not ok:
-            LOGGER.warning("Could not send control reply: %s", data.get("description", "Unknown error"))
+    def speed_name(self) -> str:
+        s = self.store.settings()
+        batch = int(s.get("batch_size") or 25)
+        delay = float(s.get("delay_seconds") or 0.6)
+        if batch <= 12 or delay >= 0.8:
+            return "Safe"
+        if batch >= 40 or delay <= 0.4:
+            return "Fast"
+        return "Balanced"
 
-    def ensure_not_running(self, chat_id: int, message: dict[str, Any]) -> bool:
-        if self.controller.worker_running():
-            self.reply(chat_id, message, "A copy job is running. Use /pause, wait for the live card to show PAUSED, then change IDs/settings.")
+    def setup_text(self, note: str = "") -> str:
+        s = self.store.settings()
+        rows = [
+            "⚙️ <b>SETUP</b>",
+            f"📥 Source  <code>{self._short(s['source_channel'], 28)}</code>",
+            f"📤 Target  <code>{self._short(s['target_channel'], 28)}</code>",
+            f"🎯 Range  <code>{s['range_start']} → {s['range_end']}</code>",
+            f"⚡ Speed  <code>{self.speed_name()}</code>",
+        ]
+        return self.symbol_panel("CHANNEL COPIER", rows, note or "Tap a field, then send one value.")
+
+    def setup_keyboard(self) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📥 Source", callback_data="input:source"),
+                InlineKeyboardButton("📤 Target", callback_data="input:target"),
+            ],
+            [
+                InlineKeyboardButton("🎯 Range", callback_data="input:range"),
+                InlineKeyboardButton("🧪 Test", callback_data="input:test"),
+            ],
+            [
+                InlineKeyboardButton(f"⚡ {self.speed_name()}", callback_data="speed"),
+                InlineKeyboardButton("◀️ Panel", callback_data="status"),
+            ],
+        ])
+
+    def speed_text(self) -> str:
+        return self.symbol_panel(
+            "COPY SPEED",
+            [
+                "⚖️ <b>Balanced</b>  recommended",
+                "🐢 Safe  •  slower and steadier",
+                "🚀 Fast  •  quicker, may hit limits",
+            ],
+            "Choose one speed preset below.",
+        )
+
+    @staticmethod
+    def speed_keyboard() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🐢 Safe", callback_data="speed:safe"),
+                InlineKeyboardButton("⚖️ Balanced", callback_data="speed:balanced"),
+            ],
+            [InlineKeyboardButton("🚀 Fast", callback_data="speed:fast")],
+            [InlineKeyboardButton("◀️ Setup", callback_data="setup")],
+        ])
+
+    def input_text(self, action: str, error: str = "") -> str:
+        prompts = {
+            "source": ("SOURCE CHANNEL", "Send old channel ID, @username, or post link.", "<code>@old_channel_username</code>"),
+            "target": ("TARGET CHANNEL", "Send new channel ID or @username.", "<code>@new_channel_username</code>"),
+            "range": ("MESSAGE RANGE", "Send start and end message IDs.", "<code>1 2123</code>"),
+            "test": ("TEST FILE", "Send one file ID or Telegram post link.", "<code>181</code>"),
+        }
+        title, guidance, example = prompts[action]
+        note = error or f"Reply with one value  •  Example {example}"
+        return self.symbol_panel(title, [f"✍️ {guidance}"], note)
+
+    def input_keyboard(self) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([[InlineKeyboardButton("✕ Cancel", callback_data="input:cancel")]])
+
+    # ------------------------------------------------------------------
+    # Owner/auth and silent helpers
+    # ------------------------------------------------------------------
+    def is_owner(self, user_id: int) -> bool:
+        owner = self.owner_id()
+        return owner > 0 and user_id == owner
+
+    async def claim_if_needed(self, message: Message, command: str) -> bool:
+        if not message.from_user:
+            return False
+        user_id = int(message.from_user.id)
+        owner = self.owner_id()
+        if owner:
+            return user_id == owner
+        if command == "claim":
+            self.store.set_owner_id(user_id)
+            self.controller.set_owner_id(user_id)
+            self.queue_menu_sync(force=True)
+            await asyncio.to_thread(self.controller.publish_status)
+            return False
+        # A misconfigured owner is the only case where a separate reply is needed.
+        # It still uses the same compact branch style as every other bot card.
+        with contextlib.suppress(Exception):
+            await message.reply_text(
+                self.symbol_panel(
+                    "ACCESS REQUIRED",
+                    [
+                        "🔒 Set <code>OWNER_ID</code> in Space Secrets",
+                        "🔄 Restart the Space after saving it",
+                    ],
+                    "Or send <code>/claim</code> once from your owner account.",
+                ),
+                disable_web_page_preview=True,
+            )
+        return False
+
+    async def delete_user_message(self, message: Message) -> None:
+        """Best-effort cleanup of setup replies and typed commands in the owner PM."""
+        with contextlib.suppress(Exception):
+            await message.delete()
+
+    async def edit_panel(self, query: CallbackQuery, text: str, markup: InlineKeyboardMarkup) -> None:
+        try:
+            if query.message:
+                await query.message.edit_text(text, disable_web_page_preview=True, reply_markup=markup)
+        except Exception as exc:  # noqa: BLE001
+            if "MESSAGE_NOT_MODIFIED" not in str(exc).upper():
+                LOGGER.warning("Could not edit compact panel: %s", exc)
+
+    async def edit_panel_by_id(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        markup: InlineKeyboardMarkup,
+    ) -> None:
+        try:
+            await self.client.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                disable_web_page_preview=True,
+                reply_markup=markup,
+            )
+        except Exception as exc:  # noqa: BLE001
+            if "MESSAGE_NOT_MODIFIED" not in str(exc).upper():
+                LOGGER.warning("Could not edit compact panel by id: %s", exc)
+
+    async def set_status_note(self, note: str) -> None:
+        job = self.store.job()
+        job["note"] = note
+        self.store.save_job(job)
+        await asyncio.to_thread(self.controller.publish_status)
+
+    async def ensure_not_running(self, panel_id: int, owner_id: int) -> bool:
+        if await asyncio.to_thread(self.controller.worker_running):
+            await self.edit_panel_by_id(
+                owner_id,
+                panel_id,
+                self.setup_text("⏳ Pause the running task before changing setup."),
+                self.setup_keyboard(),
+            )
             return False
         return True
 
-    def reset_for_changed_range(self) -> None:
-        settings = self.store.settings()
-        start = self.parse_message_id(settings["range_start"])
-        end = self.parse_message_id(settings["range_end"])
-        if start and end and end >= start:
-            self.store.reset_job(start, end)
-            self.controller.publish_status()
+    # ------------------------------------------------------------------
+    # Commands: no extra bot cards; existing control card updates in place.
+    # ------------------------------------------------------------------
+    async def on_command(self, _client: Client, message: Message) -> None:
+        if not message.from_user or not message.text:
+            return
+        command, _args = self.parse_command(message.text)
+        if not await self.claim_if_needed(message, command):
+            return
 
-    def app_status_text(self) -> str:
-        owner = self.owner_id()
-        return (
-            "🔐 Render secret status\n\n"
-            "BOT_TOKEN: configured (never shown)\n"
-            f"OWNER_ID: {owner if owner else 'not set — use /claim'}\n"
-            f"API_ID / APP_ID: {'configured' if self.api_id_configured else 'not set'}\n"
-            f"API_HASH / APP_HASH: {'configured' if self.api_hash_configured else 'not set'}\n\n"
-            "This copier uses Telegram Bot API, so only BOT_TOKEN is required for copying. API_ID and API_HASH are stored as optional Render secrets and are never displayed or used for a user login."
-        )
+        if command == "start" or command == "status":
+            await asyncio.to_thread(self.controller.publish_status)
+        elif command == "copy":
+            await self.start_or_resume()
+        elif command == "pause":
+            await self.pause_job()
+        elif command == "syncmenu":
+            self.queue_menu_sync(force=True)
+            await self.set_status_note("🔄 Command menu refresh requested. Close and reopen this PM once the log confirms it.")
+        elif command == "claim":
+            await asyncio.to_thread(self.controller.publish_status)
 
-    def config_text(self) -> str:
-        settings = self.store.settings()
-        return (
-            "⚙️ Saved copy configuration\n\n"
-            f"Source: {settings['source_channel'] or 'not set'}\n"
-            f"Target: {settings['target_channel'] or 'not set'}\n"
-            f"Range: {settings['range_start']}–{settings['range_end']}\n"
-            f"Batch: {settings['batch_size']} IDs\n"
-            f"Delay: {settings['delay_seconds']} seconds\n"
-            f"PM update: every {settings['status_every_ids']} IDs or {settings['status_every_seconds']}s\n\n"
-            "All live job status uses one editable message in this bot PM."
-        )
+        await self.delete_user_message(message)
 
-    def handle_owner_command(self, command: str, args: list[str], chat_id: int, message: dict[str, Any]) -> None:
-        if command in {"start", "help", "menu"}:
-            self.reply(chat_id, message, HELP_TEXT)
-            self.controller.publish_status()
+    async def start_or_resume(self) -> tuple[bool, str]:
+        job = self.store.job()
+        if job.get("status") == "completed":
+            text = "✅ This range is complete. Open Setup and choose a new range."
+            await self.set_status_note(text)
+            return False, text
+        ok, text = await asyncio.to_thread(self.controller.start, False)
+        if not ok:
+            await self.set_status_note(f"⚠️ {text}")
+        return ok, text
+
+    async def pause_job(self) -> tuple[bool, str]:
+        ok, text = await asyncio.to_thread(self.controller.pause)
+        if not ok:
+            await self.set_status_note(f"⚠️ {text}")
+        return ok, text
+
+    # ------------------------------------------------------------------
+    # Inline callbacks and in-place reply prompts
+    # ------------------------------------------------------------------
+    async def on_callback(self, _client: Client, query: CallbackQuery) -> None:
+        if not query.from_user:
             return
-        if command == "status":
-            # Intentionally no extra reply: the existing PM status card is edited.
-            self.controller.publish_status()
+        user_id = int(query.from_user.id)
+        if not self.is_owner(user_id):
+            await query.answer("Owner only.", show_alert=True)
             return
-        if command == "owner":
-            owner = self.owner_id()
-            source = "Render OWNER_ID" if self.configured_owner_id else "claimed owner"
-            self.reply(chat_id, message, f"👤 Controller owner: {owner}\nSource: {source}")
+        data = query.data or ""
+
+        if data == "status" or data == "home":
+            await query.answer("Panel refreshed")
+            await asyncio.to_thread(self.controller.publish_status)
             return
-        if command == "appstatus":
-            self.reply(chat_id, message, self.app_status_text())
+        if data == "setup":
+            await query.answer()
+            await self.edit_panel(query, self.setup_text(), self.setup_keyboard())
             return
-        if command == "config":
-            self.reply(chat_id, message, self.config_text())
+        if data == "speed":
+            await query.answer()
+            await self.edit_panel(query, self.speed_text(), self.speed_keyboard())
             return
-        if command == "setsource":
-            if not self.ensure_not_running(chat_id, message):
+        if data.startswith("speed:"):
+            if await asyncio.to_thread(self.controller.worker_running):
+                await query.answer("Pause the task before changing speed.", show_alert=True)
                 return
-            if len(args) != 1:
-                self.reply(chat_id, message, "Usage: /setsource -1001234567890\nYou may also paste a t.me/c/... source link.")
-                return
-            source = self.parse_channel_reference(args[0])
-            if not source:
-                self.reply(chat_id, message, "Invalid source. Use -100… , @publicchannel, or a private t.me/c/... link.")
-                return
-            self.store.set("source_channel", source)
-            self.reset_for_changed_range()
-            self.reply(chat_id, message, f"✅ Source channel saved: {source}")
+            preset = data.split(":", 1)[1]
+            await self.apply_speed_preset(preset)
+            await query.answer(f"{preset.title()} speed saved")
+            await self.edit_panel(query, self.setup_text(f"✅ {preset.title()} speed saved."), self.setup_keyboard())
             return
-        if command == "settarget":
-            if not self.ensure_not_running(chat_id, message):
-                return
-            if len(args) != 1:
-                self.reply(chat_id, message, "Usage: /settarget -1001234567890\nYou may also paste a t.me/c/... target link.")
-                return
-            target = self.parse_channel_reference(args[0])
-            if not target:
-                self.reply(chat_id, message, "Invalid target. Use -100… , @publicchannel, or a private t.me/c/... link.")
-                return
-            self.store.set("target_channel", target)
-            self.reset_for_changed_range()
-            self.reply(chat_id, message, f"✅ Target channel saved: {target}")
+        if data == "start":
+            ok, text = await self.start_or_resume()
+            await query.answer("Copy started" if ok else text[:180], show_alert=not ok)
             return
-        if command == "setrange":
-            if not self.ensure_not_running(chat_id, message):
+        if data == "pause":
+            ok, text = await self.pause_job()
+            await query.answer("Pause requested" if ok else text[:180], show_alert=not ok)
+            return
+        if data == "sync":
+            self.queue_menu_sync(force=True)
+            await query.answer("Menu refresh started")
+            return
+        if data == "input:cancel":
+            self._pending.pop(user_id, None)
+            await query.answer("Cancelled")
+            await self.edit_panel(query, self.setup_text(), self.setup_keyboard())
+            return
+        if data.startswith("input:"):
+            action = data.split(":", 1)[1]
+            await self.ask_for_input(query, action)
+            return
+
+        await query.answer()
+
+    async def ask_for_input(self, query: CallbackQuery, action: str) -> None:
+        if action not in {"source", "target", "range", "test"} or not query.message or not query.from_user:
+            return
+        if not await self.ensure_not_running(int(query.message.id), int(query.from_user.id)):
+            await query.answer("Pause task before editing.", show_alert=True)
+            return
+        self._pending[int(query.from_user.id)] = PendingInput(action=action, panel_id=int(query.message.id))
+        await query.answer("Send one reply")
+        await self.edit_panel(query, self.input_text(action), self.input_keyboard())
+
+    async def on_text_input(self, _client: Client, message: Message) -> None:
+        if not message.from_user or not message.text or message.text.startswith("/"):
+            return
+        user_id = int(message.from_user.id)
+        if not self.is_owner(user_id):
+            return
+        pending = self._pending.get(user_id)
+        if not pending:
+            return
+        # A reply is preferred. A plain message is also accepted for Android clients.
+        if message.reply_to_message and int(message.reply_to_message.id) != pending.panel_id:
+            return
+        self._pending.pop(user_id, None)
+        if not await self.ensure_not_running(pending.panel_id, user_id):
+            await self.delete_user_message(message)
+            return
+        await self.apply_input(user_id, pending, message.text.strip())
+        await self.delete_user_message(message)
+
+    async def apply_input(self, user_id: int, pending: PendingInput, raw: str) -> None:
+        action = pending.action
+        if action in {"source", "target"}:
+            value = self.parse_channel_reference(raw)
+            if not value:
+                await self.edit_panel_by_id(
+                    user_id, pending.panel_id,
+                    self.input_text(action, "⚠️ Invalid value. Send -100…, @channel, or t.me link."),
+                    self.input_keyboard(),
+                )
+                self._pending[user_id] = pending
                 return
-            if len(args) != 2:
-                self.reply(chat_id, message, "Usage: /setrange START_ID END_ID\nExample: /setrange 1 2123")
+            self.store.set("source_channel" if action == "source" else "target_channel", value)
+            await self.reset_for_changed_range()
+            label = "source" if action == "source" else "target"
+            await self.edit_panel_by_id(
+                user_id, pending.panel_id,
+                self.setup_text(f"✅ {label.title()} saved."),
+                self.setup_keyboard(),
+            )
+            return
+
+        if action == "range":
+            values = [self.parse_message_id(part) for part in re.split(r"[\s,\-]+", raw.strip()) if part]
+            if len(values) != 2 or not all(values) or int(values[0]) < 1 or int(values[1]) < int(values[0]):
+                await self.edit_panel_by_id(
+                    user_id, pending.panel_id,
+                    self.input_text("range", "⚠️ Use two IDs: 1 2123"),
+                    self.input_keyboard(),
+                )
+                self._pending[user_id] = pending
                 return
-            start, end = (self.parse_message_id(value) for value in args)
-            if not start or not end or start < 1 or end < start:
-                self.reply(chat_id, message, "Invalid range. END_ID must be equal to or larger than START_ID.")
-                return
+            start, end = int(values[0]), int(values[1])
             self.store.set("range_start", start)
             self.store.set("range_end", end)
             self.store.reset_job(start, end)
-            self.controller.publish_status()
-            self.reply(chat_id, message, f"✅ Range saved: {start:,}–{end:,}. Progress reset.")
-            return
-        if command in {"setstart", "setend"}:
-            if not self.ensure_not_running(chat_id, message):
-                return
-            if len(args) != 1:
-                self.reply(chat_id, message, f"Usage: /{command} MESSAGE_ID")
-                return
-            value = self.parse_message_id(args[0])
-            if not value or value < 1:
-                self.reply(chat_id, message, "Invalid message ID.")
-                return
-            key = "range_start" if command == "setstart" else "range_end"
-            self.store.set(key, value)
-            settings = self.store.settings()
-            start, end = int(settings["range_start"]), int(settings["range_end"])
-            if end < start:
-                self.reply(chat_id, message, "Saved, but the range is incomplete. Set the other endpoint so END_ID ≥ START_ID.")
-            else:
-                self.store.reset_job(start, end)
-                self.controller.publish_status()
-                self.reply(chat_id, message, f"✅ Range saved: {start:,}–{end:,}. Progress reset.")
-            return
-        if command == "setbatch":
-            if not self.ensure_not_running(chat_id, message):
-                return
-            if len(args) != 1 or not args[0].isdigit() or not 1 <= int(args[0]) <= 100:
-                self.reply(chat_id, message, "Usage: /setbatch 25\nChoose a whole number from 1 to 100.")
-                return
-            self.store.set("batch_size", int(args[0]))
-            self.controller.publish_status()
-            self.reply(chat_id, message, f"✅ Batch size saved: {args[0]} IDs.")
-            return
-        if command == "setdelay":
-            if not self.ensure_not_running(chat_id, message):
-                return
-            if len(args) != 1:
-                self.reply(chat_id, message, "Usage: /setdelay 0.6")
-                return
-            try:
-                delay = float(args[0])
-                if not 0 <= delay <= 30:
-                    raise ValueError
-            except ValueError:
-                self.reply(chat_id, message, "Delay must be a number from 0 to 30 seconds.")
-                return
-            self.store.set("delay_seconds", f"{delay:.2f}")
-            self.controller.publish_status()
-            self.reply(chat_id, message, f"✅ Batch delay saved: {delay:.2f}s.")
-            return
-        if command == "setinterval":
-            if not self.ensure_not_running(chat_id, message):
-                return
-            if len(args) != 2 or not all(value.isdigit() for value in args):
-                self.reply(chat_id, message, "Usage: /setinterval 25 20\nFirst = IDs, second = seconds.")
-                return
-            every_ids, every_seconds = (int(value) for value in args)
-            if not 1 <= every_ids <= 500 or not 5 <= every_seconds <= 300:
-                self.reply(chat_id, message, "IDs must be 1–500 and seconds must be 5–300.")
-                return
-            self.store.set("status_every_ids", every_ids)
-            self.store.set("status_every_seconds", every_seconds)
-            self.controller.publish_status()
-            self.reply(chat_id, message, f"✅ PM card updates every {every_ids} IDs or {every_seconds}s.")
-            return
-        if command == "test":
-            if len(args) != 1:
-                self.reply(chat_id, message, "Usage: /test OLD_FILE_MESSAGE_ID\nExample: /test 181")
-                return
-            message_id = self.parse_message_id(args[0])
-            if not message_id:
-                self.reply(chat_id, message, "Invalid source message ID.")
-                return
-            _ok, text = self.controller.test_copy(message_id)
-            self.reply(chat_id, message, text)
-            return
-        if command in {"copy", "resume", "restart"}:
-            restart = command == "restart"
-            if command == "resume" and self.store.job()["status"] != "paused":
-                self.reply(chat_id, message, "The job is not paused. Use /copy for a new configured range.")
-                return
-            ok, text = self.controller.start(restart=restart)
-            if not ok:
-                self.reply(chat_id, message, text)
-            return
-        if command == "pause":
-            ok, text = self.controller.pause()
-            if not ok:
-                self.reply(chat_id, message, text)
+            await self.edit_panel_by_id(
+                user_id, pending.panel_id,
+                self.setup_text(f"✅ Range saved: <code>{start:,} → {end:,}</code>"),
+                self.setup_keyboard(),
+            )
             return
 
-        self.reply(chat_id, message, "Unknown command. Use /help.")
+        if action == "test":
+            msg_id = self.parse_message_id(raw)
+            if not msg_id:
+                await self.edit_panel_by_id(
+                    user_id, pending.panel_id,
+                    self.input_text("test", "⚠️ Send one message ID or post link."),
+                    self.input_keyboard(),
+                )
+                self._pending[user_id] = pending
+                return
+            ok, text = await asyncio.to_thread(self.controller.test_copy, msg_id)
+            note = text.replace("✅ ", "✅ ").replace("❌ ", "❌ ")
+            await self.edit_panel_by_id(user_id, pending.panel_id, self.setup_text(note), self.setup_keyboard())
+
+    async def apply_speed_preset(self, preset: str) -> None:
+        presets = {
+            "safe": {"batch_size": 10, "delay_seconds": "0.90", "individual_delay_seconds": "0.18"},
+            "balanced": {"batch_size": 25, "delay_seconds": "0.60", "individual_delay_seconds": "0.12"},
+            "fast": {"batch_size": 50, "delay_seconds": "0.40", "individual_delay_seconds": "0.08"},
+        }
+        for key, value in presets.get(preset, presets["balanced"]).items():
+            self.store.set(key, value)
+
+    async def reset_for_changed_range(self) -> None:
+        s = self.store.settings()
+        start = self.parse_message_id(s["range_start"])
+        end = self.parse_message_id(s["range_end"])
+        if start and end and end >= start:
+            self.store.reset_job(start, end)
+
+    # ------------------------------------------------------------------
+    # Parsing
+    # ------------------------------------------------------------------
+    @staticmethod
+    def parse_command(text: str) -> tuple[str, list[str]]:
+        parts = text.split()
+        if not parts:
+            return "", []
+        return parts[0].split("@", 1)[0].lower().lstrip("/"), parts[1:]
 
     @staticmethod
     def parse_message_id(value: str) -> int | None:
@@ -411,17 +599,12 @@ class ControlBot:
         token = value.strip().rstrip("/")
         if token.startswith("-100") and token[4:].isdigit():
             return token
-        if token.startswith("@") and len(token) > 1 and re.fullmatch(r"@[A-Za-z0-9_]+", token):
+        if token.startswith("@") and re.fullmatch(r"@[A-Za-z0-9_]+", token):
             return token
-        private_match = re.search(r"(?:https?://)?t\.me/c/(\d+)(?:/\d+)?$", token, flags=re.IGNORECASE)
-        if private_match:
-            return f"-100{private_match.group(1)}"
-        public_match = re.search(r"(?:https?://)?t\.me/([A-Za-z0-9_]+)(?:/\d+)?$", token, flags=re.IGNORECASE)
-        if public_match:
-            return f"@{public_match.group(1)}"
+        private = re.search(r"(?:https?://)?t\.me/c/(\d+)(?:/\d+)?$", token, re.I)
+        if private:
+            return f"-100{private.group(1)}"
+        public = re.search(r"(?:https?://)?t\.me/([A-Za-z0-9_]+)(?:/\d+)?$", token, re.I)
+        if public:
+            return f"@{public.group(1)}"
         return None
-
-
-def install_signal_handlers(bot: ControlBot) -> None:
-    signal.signal(signal.SIGTERM, bot.stop)
-    signal.signal(signal.SIGINT, bot.stop)

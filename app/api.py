@@ -1,180 +1,199 @@
-"""Small Telegram Bot API client using only Python's standard library."""
+"""Synchronous adapter around the live Pyrogram MTProto client.
 
+The copy worker runs in a thread, while Pyrogram runs on asyncio.  This module
+bridges that safely and never calls api.telegram.org.
+"""
 from __future__ import annotations
 
-import json
+import asyncio
 import logging
-import time
-import urllib.error
-import urllib.request
-from collections.abc import Callable
-from typing import Any
+import threading
+from concurrent.futures import TimeoutError as FutureTimeout
+from typing import Any, Callable, Iterable
+
+from pyrogram import Client, raw
+from pyrogram.errors import FloodWait
+from pyrogram.types import InlineKeyboardMarkup
 
 LOGGER = logging.getLogger(__name__)
 
 
-class TelegramApiError(RuntimeError):
-    pass
-
-
 class BotApi:
-    def __init__(self, token: str, timeout: int = 45, network_retry_seconds: int = 8) -> None:
-        self.base_url = f"https://api.telegram.org/bot{token}/"
-        self.timeout = timeout
-        self.network_retry_seconds = network_retry_seconds
+    """Small MTProto facade used by the copier and the single status card."""
 
-    def call(self, method: str, payload: dict[str, Any] | None = None) -> tuple[bool, dict[str, Any]]:
-        request = urllib.request.Request(
-            self.base_url + method,
-            data=json.dumps(payload or {}, ensure_ascii=False).encode("utf-8"),
-            headers={"Content-Type": "application/json", "User-Agent": "TelegramChannelCopierRender/2.0"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                body = response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            return False, {"description": f"Network error: {exc}", "network_error": True}
+    def __init__(self, client: Client, loop: asyncio.AbstractEventLoop) -> None:
+        self.client = client
+        self.loop = loop
+        self._closed = threading.Event()
 
-        try:
-            data = json.loads(body)
-        except json.JSONDecodeError:
-            return False, {"description": f"Invalid Telegram response: {body[:300]}"}
-        return bool(data.get("ok")), data
-
-    def call_retry(
-        self,
-        method: str,
-        payload: dict[str, Any] | None = None,
-        stop_requested: Callable[[], bool] | None = None,
-        log_network_errors: bool = True,
-    ) -> tuple[bool, dict[str, Any]]:
-        is_stopped = stop_requested or (lambda: False)
-        while not is_stopped():
-            ok, data = self.call(method, payload)
-            if ok:
-                return True, data
-
-            retry_after = data.get("parameters", {}).get("retry_after")
-            if retry_after:
-                wait = max(1, int(retry_after)) + 1
-                LOGGER.warning("Telegram flood limit during %s; waiting %ss.", method, wait)
-                self._sleep_interruptible(wait, is_stopped)
-                continue
-
-            if data.get("network_error"):
-                if log_network_errors:
-                    LOGGER.warning("%s. Retrying %s in %ss.", data.get("description", "Network error"), method, self.network_retry_seconds)
-                self._sleep_interruptible(self.network_retry_seconds, is_stopped)
-                continue
-
-            return False, data
-        return False, {"description": "Stopped", "stopped": True}
+    def close(self) -> None:
+        self._closed.set()
 
     @staticmethod
-    def _sleep_interruptible(seconds: float, stop_requested: Callable[[], bool]) -> None:
-        deadline = time.monotonic() + max(0, seconds)
-        while time.monotonic() < deadline and not stop_requested():
-            time.sleep(min(0.5, max(0, deadline - time.monotonic())))
-
-    def get_me(self) -> dict[str, Any]:
-        ok, data = self.call_retry("getMe")
-        if not ok:
-            raise TelegramApiError(data.get("description", "getMe failed"))
-        return data["result"]
-
-    def set_commands(self, commands: list[dict[str, str]]) -> None:
-        """Register the command menu automatically whenever the worker starts.
-
-        Telegram keeps commands by scope. We update both the default scope and
-        the private-chat scope so the menu appears reliably in the owner's bot PM
-        without any BotFather command setup.
-        """
-        scopes: list[dict[str, Any] | None] = [
-            None,
-            {"type": "all_private_chats"},
-        ]
-        successes = 0
-        for scope in scopes:
-            payload: dict[str, Any] = {"commands": commands}
-            if scope is not None:
-                payload["scope"] = scope
-            ok, data = self.call_retry("setMyCommands", payload)
-            if ok:
-                successes += 1
-                continue
-            scope_name = scope["type"] if scope else "default"
-            LOGGER.warning(
-                "Could not register %s bot command menu: %s",
-                scope_name,
-                data.get("description", "Unknown error"),
-            )
-        if successes:
-            LOGGER.info(
-                "Registered %d command%s automatically in the bot menu (%d scope%s).",
-                len(commands),
-                "" if len(commands) == 1 else "s",
-                successes,
-                "" if successes == 1 else "s",
-            )
-
-    @staticmethod
-    def _message_payload(chat_id: str | int, text: str) -> dict[str, Any]:
+    def _error(exc: BaseException) -> dict[str, Any]:
+        detail = str(exc) or exc.__class__.__name__
         return {
-            "chat_id": chat_id,
-            "text": text,
-            "disable_notification": True,
-            "disable_web_page_preview": True,
+            "description": detail,
+            "network_error": isinstance(exc, (OSError, ConnectionError, TimeoutError, FutureTimeout)),
         }
+
+    def _run(self, coro: Any, timeout: float = 180.0) -> tuple[bool, Any]:
+        if self._closed.is_set() or self.loop.is_closed():
+            return False, {"description": "MTProto client is stopping.", "stopped": True}
+        try:
+            future = asyncio.run_coroutine_threadsafe(coro, self.loop)
+            return True, future.result(timeout=timeout)
+        except FutureTimeout:
+            return False, {"description": "MTProto request timed out.", "network_error": True}
+        except Exception as exc:  # noqa: BLE001 - convert Telegram errors to a stable worker shape
+            return False, self._error(exc)
+
+    async def _wait_flood(self, seconds: int, should_stop: Callable[[], bool]) -> bool:
+        remaining = max(1, int(seconds))
+        LOGGER.warning("Telegram flood wait: pausing %ss before retrying.", remaining)
+        while remaining > 0:
+            if should_stop():
+                return False
+            await asyncio.sleep(min(1, remaining))
+            remaining -= 1
+        return True
+
+    async def _copy_ids(self, target: str, source: str, ids: list[int], should_stop: Callable[[], bool]) -> dict[str, Any]:
+        """Copy explicit old post IDs without original-channel attribution."""
+        if should_stop():
+            return {"stopped": True}
+
+        # This queries only the supplied IDs; it does not enumerate history.
+        messages = await self.client.get_messages(source, ids)
+        if not isinstance(messages, list):
+            messages = [messages]
+        copyable = [m.id for m in messages if m and not getattr(m, "empty", False) and getattr(m, "media", None)]
+        if not copyable:
+            return {"result": [], "skipped_all": True}
+
+        try:
+            response = await self.client.invoke(
+                raw.functions.messages.ForwardMessages(
+                    from_peer=await self.client.resolve_peer(source),
+                    id=copyable,
+                    random_id=[self.client.rnd_id() for _ in copyable],
+                    to_peer=await self.client.resolve_peer(target),
+                    drop_author=True,
+                )
+            )
+        except FloodWait as exc:
+            if not await self._wait_flood(int(exc.value), should_stop):
+                return {"stopped": True}
+            return await self._copy_ids(target, source, ids, should_stop)
+
+        created: list[dict[str, int]] = []
+        for update in getattr(response, "updates", []):
+            message = getattr(update, "message", None)
+            message_id = getattr(message, "id", None)
+            if message_id:
+                created.append({"message_id": int(message_id)})
+        if not created:
+            # Telegram accepted the forwarding request but returned a compact
+            # update container. The accepted input count is still accurate.
+            created = [{"message_id": 0} for _ in copyable]
+        return {"result": created}
+
+    async def _verify_peer(self, chat: str | int) -> dict[str, Any]:
+        """Resolve one configured channel and return a concise diagnostic."""
+        peer = await self.client.resolve_peer(self._chat(chat))
+        return {
+            "id": int(getattr(peer, "channel_id", 0) or getattr(peer, "chat_id", 0) or getattr(peer, "user_id", 0) or 0),
+            "type": peer.__class__.__name__,
+        }
+
+    def verify_peer(self, chat: str | int) -> tuple[bool, dict[str, Any]]:
+        ok, data = self._run(self._verify_peer(chat), timeout=90)
+        return (True, data) if ok else (False, data)
+
+    def copy_messages(
+        self,
+        target: str,
+        source: str,
+        message_ids: Iterable[int],
+        should_stop: Callable[[], bool],
+    ) -> tuple[bool, dict[str, Any]]:
+        ids = [int(item) for item in message_ids]
+        ok, data = self._run(self._copy_ids(target, source, ids, should_stop), timeout=300)
+        if not ok:
+            return False, data
+        if data.get("stopped"):
+            return False, {"description": "Copy stopped.", "stopped": True}
+        return True, data
+
+    def copy_message(
+        self,
+        target: str,
+        source: str,
+        message_id: int,
+        should_stop: Callable[[], bool],
+    ) -> tuple[bool, dict[str, Any]]:
+        return self.copy_messages(target, source, [message_id], should_stop)
+
+    @staticmethod
+    def _chat(chat_id: str | int) -> str | int:
+        return int(chat_id) if str(chat_id).lstrip("-").isdigit() else str(chat_id)
+
+    async def _send(
+        self,
+        chat_id: str | int,
+        text: str,
+        reply_to_message_id: int | None = None,
+        reply_markup: InlineKeyboardMarkup | None = None,
+    ) -> dict[str, Any]:
+        msg = await self.client.send_message(
+            chat_id=self._chat(chat_id),
+            text=text,
+            reply_to_message_id=reply_to_message_id,
+            disable_web_page_preview=True,
+            reply_markup=reply_markup,
+        )
+        return {"result": {"message_id": int(msg.id)}}
 
     def send_message(
         self,
         chat_id: str | int,
         text: str,
-        *,
         reply_to_message_id: int | None = None,
-        disable_notification: bool = True,
+        reply_markup: InlineKeyboardMarkup | None = None,
     ) -> tuple[bool, dict[str, Any]]:
-        payload = self._message_payload(chat_id, text)
-        payload["disable_notification"] = disable_notification
-        if reply_to_message_id:
-            payload["reply_parameters"] = {"message_id": reply_to_message_id, "allow_sending_without_reply": True}
-        return self.call_retry("sendMessage", payload)
+        ok, data = self._run(self._send(chat_id, text, reply_to_message_id, reply_markup), timeout=90)
+        return (True, data) if ok else (False, data)
 
-    def send_status_message(self, chat_id: str | int, text: str) -> tuple[bool, dict[str, Any]]:
-        """One-shot status send: never block copying forever on a status outage."""
-        return self.call("sendMessage", self._message_payload(chat_id, text))
+    def send_status_message(
+        self,
+        chat_id: str | int,
+        text: str,
+        reply_markup: InlineKeyboardMarkup | None = None,
+    ) -> tuple[bool, dict[str, Any]]:
+        return self.send_message(chat_id, text, reply_markup=reply_markup)
 
-    def edit_status_message(self, chat_id: str | int, message_id: int, text: str) -> tuple[bool, dict[str, Any]]:
-        """One-shot status edit so one temporary network error does not create spam."""
-        return self.call(
-            "editMessageText",
-            {
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "text": text,
-                "disable_web_page_preview": True,
-            },
+    async def _edit(
+        self,
+        chat_id: str | int,
+        message_id: int,
+        text: str,
+        reply_markup: InlineKeyboardMarkup | None = None,
+    ) -> dict[str, Any]:
+        msg = await self.client.edit_message_text(
+            chat_id=self._chat(chat_id),
+            message_id=int(message_id),
+            text=text,
+            disable_web_page_preview=True,
+            reply_markup=reply_markup,
         )
+        return {"result": {"message_id": int(msg.id)}}
 
-    def copy_messages(self, target: str, source: str, message_ids: list[int], stop_requested: Callable[[], bool]) -> tuple[bool, dict[str, Any]]:
-        return self.call_retry(
-            "copyMessages",
-            {"chat_id": target, "from_chat_id": source, "message_ids": message_ids, "disable_notification": True},
-            stop_requested=stop_requested,
-        )
-
-    def copy_message(self, target: str, source: str, message_id: int, stop_requested: Callable[[], bool]) -> tuple[bool, dict[str, Any]]:
-        return self.call_retry(
-            "copyMessage",
-            {"chat_id": target, "from_chat_id": source, "message_id": message_id, "disable_notification": True},
-            stop_requested=stop_requested,
-        )
-
-    def get_updates(self, offset: int | None, timeout: int) -> tuple[bool, dict[str, Any]]:
-        payload: dict[str, Any] = {"timeout": timeout, "allowed_updates": ["message"]}
-        if offset is not None:
-            payload["offset"] = offset
-        return self.call_retry("getUpdates", payload, log_network_errors=False)
+    def edit_status_message(
+        self,
+        chat_id: str | int,
+        message_id: int,
+        text: str,
+        reply_markup: InlineKeyboardMarkup | None = None,
+    ) -> tuple[bool, dict[str, Any]]:
+        ok, data = self._run(self._edit(chat_id, message_id, text, reply_markup), timeout=90)
+        return (True, data) if ok else (False, data)

@@ -1,5 +1,4 @@
-"""Runtime configuration for the Render Telegram channel copier."""
-
+"""Runtime configuration for the Hugging Face Pyrogram copier."""
 from __future__ import annotations
 
 import os
@@ -9,7 +8,6 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 
 
 def load_dotenv(path: Path | None = None) -> None:
-    """Load a small local .env file without a third-party dependency."""
     env_path = path or BASE_DIR / ".env"
     if not env_path.exists():
         return
@@ -18,8 +16,7 @@ def load_dotenv(path: Path | None = None) -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
+        key, value = key.strip(), value.strip().strip('"').strip("'")
         if key and key not in os.environ:
             os.environ[key] = value
 
@@ -33,7 +30,7 @@ def env_int(name: str, default: int = 0) -> int:
     try:
         return int(raw)
     except ValueError as exc:
-        raise ValueError(f"{name} must be a number, got {raw!r}") from exc
+        raise ValueError(f"{name} must be a whole number.") from exc
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -42,38 +39,29 @@ def env_bool(name: str, default: bool = False) -> bool:
         return True
     if raw in {"0", "false", "no", "off"}:
         return False
-    raise ValueError(f"{name} must be true or false, got {raw!r}")
+    raise ValueError(f"{name} must be true or false.")
 
 
 class Settings:
-    """Runtime settings read from Render variables or a local .env file."""
-
     def __init__(self) -> None:
         load_dotenv()
         self.bot_token = env_text("BOT_TOKEN")
         self.owner_id = env_int("OWNER_ID", 0)
-
-        # Kept as optional Render secrets because the owner requested the
-        # Telegram app values to be part of the deployment configuration.
-        # This bot deliberately uses the Bot API, so it never logs in as a
-        # user and does not transmit these values to Telegram.
-        self.api_id = env_text("API_ID") or env_text("APP_ID")
-        self.api_hash = env_text("API_HASH") or env_text("APP_HASH")
-
+        self.api_id = env_int("API_ID", 0)
+        self.api_hash = env_text("API_HASH")
+        self.session_name = env_text("SESSION_NAME", "channel_copier_mtproto_bot")
         self.data_dir = Path(env_text("DATA_DIR", str(BASE_DIR / "data"))).expanduser()
         self.auto_resume = env_bool("AUTO_RESUME", True)
-        self.poll_timeout = max(5, min(env_int("POLL_TIMEOUT_SECONDS", 25), 50))
-        self.http_timeout = max(10, env_int("HTTP_TIMEOUT_SECONDS", 45))
-        self.network_retry_seconds = max(2, env_int("NETWORK_RETRY_SECONDS", 8))
         self.log_level = env_text("LOG_LEVEL", "INFO").upper()
-
-    @property
-    def app_credentials_configured(self) -> bool:
-        return bool(self.api_id and self.api_hash)
+        self.ipv6 = env_bool("PYROGRAM_IPV6", False)
 
     def validate(self) -> None:
         if not self.bot_token or ":" not in self.bot_token:
-            raise ValueError("BOT_TOKEN is missing or invalid. Set it in Render Environment settings.")
+            raise ValueError("BOT_TOKEN is missing or invalid. Add it as a Hugging Face Space Secret.")
         if self.owner_id < 0:
             raise ValueError("OWNER_ID must be a positive Telegram user ID or 0.")
+        if self.api_id <= 0:
+            raise ValueError("API_ID is required for MTProto/Pyrogram bot login.")
+        if not self.api_hash:
+            raise ValueError("API_HASH is required for MTProto/Pyrogram bot login.")
         self.data_dir.mkdir(parents=True, exist_ok=True)

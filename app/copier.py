@@ -5,8 +5,11 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from html import escape
 from dataclasses import dataclass
 from typing import Any
+
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from .api import BotApi
 from .store import Store
@@ -81,7 +84,7 @@ class CopyConfig:
 
 
 class StatusCard:
-    """Maintains exactly one editable progress/status message in the owner's PM."""
+    """Maintains one compact editable owner-PM control and progress card."""
 
     def __init__(self, api: BotApi, store: Store, owner_id: int) -> None:
         self.api = api
@@ -113,29 +116,105 @@ class StatusCard:
             "eta": eta,
         }
 
+    @staticmethod
+    def progress_bar(percent: float, width: int = 12) -> str:
+        """Render a precise compact bar.
+
+        ■ marks fully completed cells, □ marks remaining cells, and one
+        intermediate cell (▤ ▥ ▦ ▧ ▨ or ▩) represents the fractional part
+        between the two. This keeps the visual fill accurate without rounding
+        the bar up too early.
+        """
+        partial_cells = ("▤", "▥", "▦", "▧", "▨", "▩")
+        safe_width = max(1, int(width))
+        clipped = max(0.0, min(100.0, float(percent)))
+        units = (clipped / 100.0) * safe_width
+        full = min(safe_width, int(units))
+
+        # 100% must contain completed cells only.
+        if full >= safe_width:
+            return "■" * safe_width
+
+        fraction = units - full
+        partial = ""
+        if fraction > 1e-9:
+            # Choose one of six visible in-between states. A tiny fraction
+            # uses ▤; a near-full fractional cell uses ▩.
+            index = min(len(partial_cells) - 1, max(0, int(fraction * len(partial_cells))))
+            partial = partial_cells[index]
+
+        empty = safe_width - full - (1 if partial else 0)
+        return "■" * full + partial + "□" * empty
+
+    @staticmethod
+    def keyboard(job: dict[str, Any]) -> InlineKeyboardMarkup:
+        state = str(job.get("status", "idle")).lower()
+        if state in {"running", "stopping"}:
+            first = InlineKeyboardButton("⏸ Pause", callback_data="pause")
+            return InlineKeyboardMarkup([
+                [first, InlineKeyboardButton("🔄 Refresh", callback_data="status")],
+            ])
+        start_text = "▶️ Resume" if state == "paused" else "▶️ Start"
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("⚙️ Setup", callback_data="setup"),
+                InlineKeyboardButton("🧪 Test", callback_data="input:test"),
+            ],
+            [
+                InlineKeyboardButton(start_text, callback_data="start"),
+                InlineKeyboardButton("⚡ Speed", callback_data="speed"),
+            ],
+            [InlineKeyboardButton("🔄 Refresh", callback_data="status")],
+        ])
+
+    @staticmethod
+    def _short(value: str, limit: int = 24) -> str:
+        value = value or "not set"
+        return value if len(value) <= limit else value[: limit - 1] + "…"
+
     @classmethod
     def text(cls, job: dict[str, Any], settings: dict[str, str], title: str | None = None, note: str = "") -> str:
         data = cls.stats(job)
-        state = str(job.get("status", "idle")).upper()
-        lines = [
-            title or status_title(str(job.get("status", "idle"))),
-            "",
-            f"State: {state}",
-            f"Source: {settings.get('source_channel') or 'not set'}",
-            f"Target: {settings.get('target_channel') or 'not set'}",
-            f"Range: {int(job.get('start_id', 1)):,}–{int(job.get('end_id', 0)):,}",
-            f"Progress: {int(data['processed']):,}/{int(data['total']):,} ({float(data['percent']):.1f}%)",
-            f"Copied: {int(job.get('copied', 0)):,}  |  Skipped: {int(job.get('skipped', 0)):,}",
-            f"Next source ID: {int(job.get('next_id', 1)):,}",
-            f"Speed: {float(data['speed']):.2f} IDs/s  |  ETA: {format_duration(data['eta'])}",
-            f"Elapsed: {format_duration(float(data['elapsed']))}",
-            f"Batch: {settings.get('batch_size', '25')}  |  Delay: {settings.get('delay_seconds', '0.60')}s",
-            "",
-            "This is the single live status message. It updates in place.",
+        state = str(job.get("status", "idle")).lower()
+        state_badges = {
+            "running": ("🟢", "RUNNING"),
+            "stopping": ("🟠", "PAUSING"),
+            "paused": ("🟡", "PAUSED"),
+            "completed": ("✅", "COMPLETE"),
+            "error": ("🔴", "ERROR"),
+            "idle": ("🔵", "READY"),
+        }
+        icon, label = state_badges.get(state, ("🔵", state.upper() or "READY"))
+        processed = int(data["processed"])
+        total = int(data["total"])
+        percent = float(data["percent"])
+        next_id = int(job.get("next_id", 1))
+        bar = cls.progress_bar(percent)
+        source = escape(cls._short(str(settings.get("source_channel") or "not set")))
+        target = escape(cls._short(str(settings.get("target_channel") or "not set")))
+        speed_name = "Safe" if int(settings.get("batch_size") or 25) <= 12 else ("Fast" if int(settings.get("batch_size") or 25) >= 40 else "Balanced")
+
+        rows = [
+            f"{icon} <b>{label}</b>  •  <code>{percent:.1f}%</code>",
+            f"<code>{bar}</code>  <b>{processed:,} / {total:,}</b>",
+            f"✅ <b>{int(job.get('copied', 0)):,}</b> copied  •  ⏭ <b>{int(job.get('skipped', 0)):,}</b> skipped",
+            f"📥 Next <code>{next_id:,}</code>  •  ⚡ <code>{float(data['speed']):.2f}/s</code>",
+            f"⏳ <code>{format_duration(data['eta'])}</code>  •  🕒 <code>{format_duration(float(data['elapsed']))}</code>",
+            f"🎯 <code>{int(job.get('start_id', 1)):,} → {int(job.get('end_id', 0)):,}</code>  •  ⚡ <code>{speed_name}</code>",
+            f"📥 <code>{source}</code>",
+            f"📤 <code>{target}</code>",
         ]
         detail = note or str(job.get("note") or job.get("error") or "")
+        content = list(rows)
         if detail:
-            lines.extend(["", f"Note: {detail}"])
+            content.append(f"💬 {escape(detail)}")
+        if not content:
+            content.append("ℹ️ No status details available")
+
+        lines = ["▤ <b>CHANNEL COPIER</b>"]
+        for index, row in enumerate(content):
+            branch = "└" if index == len(content) - 1 else "├"
+            lines.append(f"{branch} {row}")
         return "\n".join(lines)
 
     @staticmethod
@@ -152,11 +231,12 @@ class StatusCard:
             return False
         chat_id = str(self.owner_id)
         text = self.text(job, self.store.settings(), title=title, note=note)
+        markup = self.keyboard(job)
 
         stored_chat = str(job.get("status_chat_id") or "")
         message_id = job.get("status_message_id") if stored_chat == chat_id else None
         if message_id:
-            ok, data = self.api.edit_status_message(chat_id, int(message_id), text)
+            ok, data = self.api.edit_status_message(chat_id, int(message_id), text, reply_markup=markup)
             description = str(data.get("description", ""))
             if ok or "message is not modified" in description.lower():
                 return True
@@ -166,17 +246,16 @@ class StatusCard:
             if not self._can_replace_card(description):
                 LOGGER.warning("Could not update owner status card: %s", description or "Unknown error")
                 return False
-            # The old card was deleted or cannot be edited. Replace it once.
             job["status_message_id"] = None
             job["status_chat_id"] = ""
             self.store.save_job(job)
 
-        ok, data = self.api.send_status_message(chat_id, text)
+        ok, data = self.api.send_status_message(chat_id, text, reply_markup=markup)
         if ok:
             job["status_chat_id"] = chat_id
             job["status_message_id"] = data.get("result", {}).get("message_id")
             self.store.save_job(job)
-            LOGGER.info("Owner status card created in private chat %s.", chat_id)
+            LOGGER.info("Owner compact control card created in private chat %s.", chat_id)
             return True
 
         description = str(data.get("description", "Unknown error"))
@@ -339,7 +418,7 @@ class CopyWorker:
 
         if self.stopped():
             job["status"] = "paused"
-            job["note"] = "Use /resume to continue from the saved next source ID."
+            job["note"] = "Tap Start / Resume to continue from the saved next source ID."
             self.store.save_job(job)
             LOGGER.info("Copy paused safely at source ID %s.", job["next_id"])
             card.update(job)
@@ -376,13 +455,13 @@ class CopyController:
         start_id = as_int(settings["range_start"], 1)
         end_id = as_int(settings["range_end"], 0)
         if self.owner_id <= 0:
-            raise ValueError("Claim the bot first with /claim, or set OWNER_ID in Render.")
+            raise ValueError("Set OWNER_ID in Hugging Face Space Secrets, then restart the Space.")
         if not source or not target:
-            raise ValueError("Set source and target first: /setsource … then /settarget …")
+            raise ValueError("Open /start → Setup and set the source and target channels first.")
         if source == target:
             raise ValueError("Source and target must be different channels.")
         if require_range and (start_id < 1 or end_id < start_id):
-            raise ValueError("Set a valid range first: /setrange START_ID END_ID")
+            raise ValueError("Open /start → Setup and set a valid message range first.")
         if not require_range and (start_id < 1 or end_id < start_id):
             start_id, end_id = 1, 1
 
@@ -408,7 +487,7 @@ class CopyController:
     def start(self, restart: bool = False) -> tuple[bool, str]:
         with self._lock:
             if self.worker_running():
-                return False, "A copy job is already running. Check the live status card or use /pause."
+                return False, "A copy job is already running. Use the Pause button on the live status card."
             try:
                 config = self.current_config()
             except ValueError as exc:
@@ -417,7 +496,7 @@ class CopyController:
             job = self.store.job()
             same_range = int(job["start_id"]) == config.start_id and int(job["end_id"]) == config.end_id
             if job["status"] == "completed" and same_range and not restart:
-                return False, "This range is complete. Use /restart to copy it again, or /setrange for another range."
+                return False, "This range is complete. Open Setup to choose a new range."
             if restart or not same_range or job["status"] in {"idle", "completed", "error"}:
                 job = self.store.reset_job(config.start_id, config.end_id)
             elif job["status"] == "paused":
@@ -442,7 +521,7 @@ class CopyController:
                 job = self.store.job()
                 if job["status"] == "running":
                     job["status"] = "paused"
-                    job["note"] = "No active worker remains. Use /resume to continue."
+                    job["note"] = "No active worker remains. Tap Start / Resume to continue."
                     self.store.save_job(job)
                 self.publish_status()
                 return False, "No active copy thread is running."
@@ -454,6 +533,18 @@ class CopyController:
             self.publish_status()
             return True, "Pause requested. The status card will change to PAUSED when safe."
 
+    @staticmethod
+    def _peer_hint(label: str, detail: str) -> str:
+        lowered = detail.lower()
+        if "peer_id_invalid" in lowered or "peer id" in lowered or "not known yet" in lowered:
+            return (
+                f"❌ {label} channel cannot be resolved. Add the bot as an administrator in that channel, "
+                "then restart the Space and test again."
+            )
+        if "channel_private" in lowered or "not a member" in lowered or "forbidden" in lowered:
+            return f"❌ {label} channel is not accessible to the bot. Add the bot as an administrator, then retry."
+        return f"❌ {label} check failed: {detail}"
+
     def test_copy(self, message_id: int) -> tuple[bool, str]:
         with self._lock:
             if self.worker_running():
@@ -462,11 +553,27 @@ class CopyController:
                 config = self.current_config(require_range=False)
             except ValueError as exc:
                 return False, str(exc)
+
+        # Test both configured peers first, so an invalid source/target is shown clearly.
+        source_ok, source_data = self.api.verify_peer(config.source)
+        if not source_ok:
+            return False, self._peer_hint("Source", str(source_data.get("description", "Unknown Telegram error")))
+
+        target_ok, target_data = self.api.verify_peer(config.target)
+        if not target_ok:
+            return False, self._peer_hint("Target", str(target_data.get("description", "Unknown Telegram error")))
+
         ok, data = self.api.copy_message(config.target, config.source, message_id, lambda: False)
         if ok:
-            target_id = data.get("result", {}).get("message_id", "?")
-            return True, f"✅ Test passed. Source {message_id:,} copied as target message {target_id}."
-        return False, f"❌ Test failed: {data.get('description', 'Unknown Telegram error')}"
+            result = data.get("result") or []
+            first = result[0] if isinstance(result, list) and result else {}
+            target_id = first.get("message_id", "?") if isinstance(first, dict) else "?"
+            suffix = f" as target message {target_id}" if target_id not in {0, "?"} else ""
+            return True, f"✅ Test passed. Source {message_id:,} was copied{suffix}."
+        detail = str(data.get("description", "Unknown Telegram error"))
+        if "chat_forwards_restricted" in detail.lower() or "forwards restricted" in detail.lower():
+            return False, "❌ Test file is protected by Telegram content protection and cannot be copied."
+        return False, f"❌ Test failed: {detail}"
 
     def _on_finished(self, _status: str) -> None:
         with self._lock:

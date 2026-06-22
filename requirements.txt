@@ -1,1 +1,2 @@
-# Standard-library only: no pip packages are required.
+Pyrogram==2.0.106
+TgCrypto==1.2.5

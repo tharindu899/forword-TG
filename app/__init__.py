@@ -1,1 +1,1 @@
-"""Telegram channel copier package."""
+"""MTProto/Pyrogram backend for the Telegram Channel Copier."""

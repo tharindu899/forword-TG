@@ -150,6 +150,6 @@ class Store:
         if job["status"] in {"running", "stopping"}:
             job["status"] = "paused"
             job["interrupted"] = True
-            job["note"] = "Render restarted while copying."
+            job["note"] = "Hugging Face Space restarted while copying."
             self.save_job(job)
         return job
