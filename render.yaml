@@ -1,0 +1,37 @@
+services:
+  - type: worker
+    name: telegram-channel-copier
+    runtime: python
+    region: singapore
+    plan: starter
+    buildCommand: python -m compileall main.py app
+    startCommand: python main.py
+    autoDeployTrigger: commit
+    maxShutdownDelaySeconds: 300
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.11
+      - key: BOT_TOKEN
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: DATA_DIR
+        value: /var/data
+      - key: AUTO_RESUME
+        value: "true"
+      - key: POLL_TIMEOUT_SECONDS
+        value: "25"
+      - key: HTTP_TIMEOUT_SECONDS
+        value: "45"
+      - key: NETWORK_RETRY_SECONDS
+        value: "8"
+      - key: LOG_LEVEL
+        value: INFO
+    disk:
+      name: copier-data
+      mountPath: /var/data
+      sizeGB: 1
