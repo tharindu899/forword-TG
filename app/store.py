@@ -20,6 +20,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "individual_delay_seconds": "0.12",
     "status_every_ids": "25",
     "status_every_seconds": "20",
+    # The last setup field changed by the owner. It drives one compact clear button.
+    "last_clear_field": "",
 }
 
 DEFAULT_JOB: dict[str, Any] = {

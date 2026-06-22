@@ -48,9 +48,10 @@ pinned: false
 
 1. The bot runs using **Pyrogram + MTProto** with your bot token and Telegram API credentials.
 2. You open the bot’s private chat and send `/start`.
-3. One control card appears. Use inline buttons to set source, target, range, test file, and speed.
-4. The bot checks one media post with **🧪 Test**.
-5. Tap **▶️ Start**. The same card updates while copying.
+3. One control card appears. Use inline buttons to set or change source, target, range, test file, and speed.
+4. Use the single **🗑 Clear** button after choosing a source, target, or range. It clears the last chosen field directly; tap it before choosing a field to select exactly what to clear. Each clear action resets saved copy counters safely.
+5. The bot checks one media post with **🧪 Test**.
+6. Tap **▶️ Start**. The same card updates while copying.
 6. Telegram may temporarily throttle forwarding. The app waits automatically and continues.
 7. When the range finishes, the card changes to **✅ COMPLETE**.
 
@@ -67,6 +68,22 @@ pinned: false
 ├ 📥 <SOURCE_CHANNEL>
 └ 📤 <TARGET_CHANNEL>
 ```
+
+### 🧹 Change or clear saved setup
+
+Open **⚙️ Setup** from the panel. All setup actions stay inside the same editable message:
+
+| Button | What it does |
+|---|---|
+| 📥 Source | Set or replace the old/source channel |
+| 📤 Target | Set or replace the new/target channel |
+| 🎯 Range | Set or replace the start and end message IDs |
+| 🗑 Source / 🗑 Target / 🗑 Range | One context-aware bin button. After you save a field, it clears that field directly. Before a field is chosen, tap **🗑 Clear** to select source, target, or range. |
+
+> [!TIP]
+> The bot uses one active PM control card. Setup prompts, saved values, test results, running progress, pause, errors, and completion edit that same card; the bot does not send progress-message spam. The owner’s typed setup values and commands are deleted when Telegram allows it.
+
+> Clear buttons are available only while no copy task is running. Pause the task first, then change or clear its setup.
 
 ---
 

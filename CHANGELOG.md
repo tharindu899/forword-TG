@@ -1,3 +1,19 @@
+# ✨ Single-card cleanup + one-bin setup update
+
+- 🧹 The bot now keeps background progress, pause, errors, test results, and completion on **one known PM card**. Background updates never create another card when a card ID is missing or stale.
+- 🔕 `MESSAGE_NOT_MODIFIED` is treated as a normal no-op and no longer produces a warning.
+- 🗑️ Setup has **one context-aware bin button**: after you save Source, Target, or Range it directly clears that last chosen field. Tap generic **🗑 Clear** to choose a different field.
+- 🔁 Pressing any inline button adopts that message as the active panel, so the live copy status continues editing the panel you are using.
+
+# Changelog
+
+## ✨ Clear setup controls
+
+- Added **🗑 Source**, **🗑 Target**, and **🗑 Range** buttons to the one-message setup panel.
+- The buttons reset only the selected saved setting and reset stale copy counters safely.
+- Clear actions are blocked while a copy is running; pause first to prevent accidental changes.
+- Kept the compact `▤ / ├ / └` message layout and the true `■ / □` progress bar.
+
 # True Fill Progress Bar
 
 - Uses `■` for a fully completed progress cell.

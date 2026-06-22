@@ -109,7 +109,9 @@ class ControlBot:
             ok, text = await asyncio.to_thread(self.controller.start)
             LOGGER.info("Auto-resume: %s", text)
             if not ok:
-                await asyncio.to_thread(self.controller.publish_status)
+                # Auto-resume runs in the background after a Space restart.
+                # Never create a new PM card here; the owner can open /start.
+                await asyncio.to_thread(self.controller.publish_status, False)
 
         await self._stop.wait()
         await asyncio.to_thread(self.controller.request_shutdown_pause)
@@ -239,7 +241,28 @@ class ControlBot:
         ]
         return self.symbol_panel("CHANNEL COPIER", rows, note or "Tap a field, then send one value.")
 
+    def _clear_button(self) -> InlineKeyboardButton:
+        """Return exactly one bin button for the last chosen setup field.
+
+        After a source, target, or range is saved, the button becomes a direct
+        clear action for that one field. Before anything is chosen, it opens a
+        tiny selector. This keeps the setup panel compact and avoids three
+        permanent bin buttons.
+        """
+        field = self.store.get("last_clear_field", "").strip().lower()
+        settings = self.store.settings()
+        valid = {
+            "source": bool(settings.get("source_channel")),
+            "target": bool(settings.get("target_channel")),
+            "range": int(settings.get("range_end") or 0) >= int(settings.get("range_start") or 1),
+        }
+        if field in valid and valid[field]:
+            labels = {"source": "🗑 Source", "target": "🗑 Target", "range": "🗑 Range"}
+            return InlineKeyboardButton(labels[field], callback_data=f"clear:{field}")
+        return InlineKeyboardButton("🗑 Clear", callback_data="clear:choose")
+
     def setup_keyboard(self) -> InlineKeyboardMarkup:
+        """Compact one-card setup controls with one context-aware bin button."""
         return InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("📥 Source", callback_data="input:source"),
@@ -250,10 +273,45 @@ class ControlBot:
                 InlineKeyboardButton("🧪 Test", callback_data="input:test"),
             ],
             [
+                self._clear_button(),
                 InlineKeyboardButton(f"⚡ {self.speed_name()}", callback_data="speed"),
-                InlineKeyboardButton("◀️ Panel", callback_data="status"),
             ],
+            [InlineKeyboardButton("◀️ Panel", callback_data="status")],
         ])
+
+    def clear_choice_text(self) -> str:
+        settings = self.store.settings()
+        rows = [
+            f"📥 Source  <code>{self._short(settings['source_channel'], 28)}</code>",
+            f"📤 Target  <code>{self._short(settings['target_channel'], 28)}</code>",
+            f"🎯 Range  <code>{settings['range_start']} → {settings['range_end']}</code>",
+        ]
+        return self.symbol_panel(
+            "CLEAR SETUP",
+            rows,
+            "Choose one saved value to remove. The same panel stays in this chat.",
+        )
+
+    def clear_choice_keyboard(self) -> InlineKeyboardMarkup:
+        settings = self.store.settings()
+        buttons: list[list[InlineKeyboardButton]] = []
+        row: list[InlineKeyboardButton] = []
+        if settings.get("source_channel"):
+            row.append(InlineKeyboardButton("🗑 Source", callback_data="clear:source"))
+        if settings.get("target_channel"):
+            row.append(InlineKeyboardButton("🗑 Target", callback_data="clear:target"))
+        if row:
+            buttons.append(row)
+        try:
+            has_range = int(settings.get("range_end") or 0) >= int(settings.get("range_start") or 1)
+        except ValueError:
+            has_range = False
+        if has_range:
+            buttons.append([InlineKeyboardButton("🗑 Range", callback_data="clear:range")])
+        if not buttons:
+            buttons.append([InlineKeyboardButton("ℹ️ Nothing saved", callback_data="clear:back")])
+        buttons.append([InlineKeyboardButton("◀️ Setup", callback_data="clear:back")])
+        return InlineKeyboardMarkup(buttons)
 
     def speed_text(self) -> str:
         return self.symbol_panel(
@@ -332,12 +390,23 @@ class ControlBot:
         with contextlib.suppress(Exception):
             await message.delete()
 
+    @staticmethod
+    def _message_not_modified(error: BaseException | str) -> bool:
+        detail = str(error).lower()
+        return "message_not_modified" in detail or "message is not modified" in detail or "not modified" in detail
+
     async def edit_panel(self, query: CallbackQuery, text: str, markup: InlineKeyboardMarkup) -> None:
         try:
             if query.message:
                 await query.message.edit_text(text, disable_web_page_preview=True, reply_markup=markup)
+                if query.from_user:
+                    await asyncio.to_thread(
+                        self.controller.adopt_status_card,
+                        int(query.from_user.id),
+                        int(query.message.id),
+                    )
         except Exception as exc:  # noqa: BLE001
-            if "MESSAGE_NOT_MODIFIED" not in str(exc).upper():
+            if not self._message_not_modified(exc):
                 LOGGER.warning("Could not edit compact panel: %s", exc)
 
     async def edit_panel_by_id(
@@ -355,15 +424,17 @@ class ControlBot:
                 disable_web_page_preview=True,
                 reply_markup=markup,
             )
+            await asyncio.to_thread(self.controller.adopt_status_card, chat_id, message_id)
         except Exception as exc:  # noqa: BLE001
-            if "MESSAGE_NOT_MODIFIED" not in str(exc).upper():
+            if not self._message_not_modified(exc):
                 LOGGER.warning("Could not edit compact panel by id: %s", exc)
 
     async def set_status_note(self, note: str) -> None:
         job = self.store.job()
         job["note"] = note
         self.store.save_job(job)
-        await asyncio.to_thread(self.controller.publish_status)
+        # A setup/copy action already has a visible panel. Do not create another card.
+        await asyncio.to_thread(self.controller.publish_status, False)
 
     async def ensure_not_running(self, panel_id: int, owner_id: int) -> bool:
         if await asyncio.to_thread(self.controller.worker_running):
@@ -428,6 +499,10 @@ class ControlBot:
             await query.answer("Owner only.", show_alert=True)
             return
         data = query.data or ""
+        # Any pressed inline button becomes the one active status card. This lets
+        # the app keep editing the current card instead of sending a replacement.
+        if query.message:
+            await asyncio.to_thread(self.controller.adopt_status_card, user_id, int(query.message.id))
 
         if data == "status" or data == "home":
             await query.answer("Panel refreshed")
@@ -466,6 +541,36 @@ class ControlBot:
             self._pending.pop(user_id, None)
             await query.answer("Cancelled")
             await self.edit_panel(query, self.setup_text(), self.setup_keyboard())
+            return
+        if data == "clear:choose":
+            if not query.message:
+                await query.answer("Open Setup first.", show_alert=True)
+                return
+            if not await self.ensure_not_running(int(query.message.id), user_id):
+                await query.answer("Pause the task before clearing setup.", show_alert=True)
+                return
+            await query.answer()
+            await self.edit_panel(query, self.clear_choice_text(), self.clear_choice_keyboard())
+            return
+        if data == "clear:back":
+            await query.answer()
+            await self.edit_panel(query, self.setup_text(), self.setup_keyboard())
+            return
+        if data.startswith("clear:"):
+            field = data.split(":", 1)[1]
+            if field not in {"source", "target", "range"} or not query.message:
+                await query.answer("Unknown clear action.", show_alert=True)
+                return
+            if not await self.ensure_not_running(int(query.message.id), user_id):
+                await query.answer("Pause the task before clearing setup.", show_alert=True)
+                return
+            self.clear_setup_field(field)
+            await query.answer(f"{field.title()} cleared")
+            await self.edit_panel(
+                query,
+                self.setup_text(f"🗑 {field.title()} cleared. Set a new value when ready."),
+                self.setup_keyboard(),
+            )
             return
         if data.startswith("input:"):
             action = data.split(":", 1)[1]
@@ -516,6 +621,7 @@ class ControlBot:
                 self._pending[user_id] = pending
                 return
             self.store.set("source_channel" if action == "source" else "target_channel", value)
+            self.store.set("last_clear_field", action)
             await self.reset_for_changed_range()
             label = "source" if action == "source" else "target"
             await self.edit_panel_by_id(
@@ -538,6 +644,7 @@ class ControlBot:
             start, end = int(values[0]), int(values[1])
             self.store.set("range_start", start)
             self.store.set("range_end", end)
+            self.store.set("last_clear_field", "range")
             self.store.reset_job(start, end)
             await self.edit_panel_by_id(
                 user_id, pending.panel_id,
@@ -575,6 +682,33 @@ class ControlBot:
         end = self.parse_message_id(s["range_end"])
         if start and end and end >= start:
             self.store.reset_job(start, end)
+
+    def clear_setup_field(self, field: str) -> None:
+        """Clear one reusable setup value and reset the saved job safely.
+
+        A finished or paused migration must never be resumed with an old
+        source/target/range after the user changes it. Resetting the job keeps
+        the existing one-message control card, but removes old counters and
+        starts the next migration from a clean idle state.
+        """
+        settings = self.store.settings()
+        if field == "source":
+            self.store.set("source_channel", "")
+            start = self.parse_message_id(settings["range_start"]) or 1
+            end = self.parse_message_id(settings["range_end"]) or 0
+        elif field == "target":
+            self.store.set("target_channel", "")
+            start = self.parse_message_id(settings["range_start"]) or 1
+            end = self.parse_message_id(settings["range_end"]) or 0
+        elif field == "range":
+            self.store.set("range_start", 1)
+            self.store.set("range_end", 0)
+            start, end = 1, 0
+        else:
+            raise ValueError(f"Unknown setup field: {field}")
+
+        self.store.set("last_clear_field", "")
+        self.store.reset_job(start, end)
 
     # ------------------------------------------------------------------
     # Parsing

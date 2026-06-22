@@ -226,7 +226,26 @@ class StatusCard:
             "message identifier is not specified",
         ))
 
-    def update(self, job: dict[str, Any], *, title: str | None = None, note: str = "") -> bool:
+    @staticmethod
+    def _not_modified(description: str) -> bool:
+        lowered = description.lower()
+        return "message_not_modified" in lowered or "message is not modified" in lowered or "not modified" in lowered
+
+    def update(
+        self,
+        job: dict[str, Any],
+        *,
+        title: str | None = None,
+        note: str = "",
+        allow_create: bool = True,
+    ) -> bool:
+        """Edit the one known owner card.
+
+        Background copy updates call this with ``allow_create=False``. That
+        prevents a restart, a stale card ID, or a transient edit failure from
+        creating a stream of new private messages. A fresh card is created
+        only when the owner explicitly uses /start or /status.
+        """
         if self.owner_id <= 0:
             return False
         chat_id = str(self.owner_id)
@@ -238,7 +257,7 @@ class StatusCard:
         if message_id:
             ok, data = self.api.edit_status_message(chat_id, int(message_id), text, reply_markup=markup)
             description = str(data.get("description", ""))
-            if ok or "message is not modified" in description.lower():
+            if ok or self._not_modified(description):
                 return True
             if data.get("network_error"):
                 LOGGER.warning("Could not update owner status card: %s", description)
@@ -249,6 +268,9 @@ class StatusCard:
             job["status_message_id"] = None
             job["status_chat_id"] = ""
             self.store.save_job(job)
+
+        if not allow_create:
+            return False
 
         ok, data = self.api.send_status_message(chat_id, text, reply_markup=markup)
         if ok:
@@ -269,7 +291,7 @@ class StatusCard:
         time_due = now - self.last_sent_at >= config.status_every_seconds
         if not force and not (ids_due or time_due):
             return
-        self.update(job)
+        self.update(job, allow_create=False)
         self.last_processed = processed
         self.last_sent_at = now
 
@@ -332,7 +354,7 @@ class CopyWorker:
         elif note:
             job["error"] = note
         self.store.save_job(job)
-        StatusCard(self.api, self.store, self.config.owner_id).update(job)
+        StatusCard(self.api, self.store, self.config.owner_id).update(job, allow_create=False)
         self.on_finished(status)
 
     def _run(self) -> None:
@@ -478,8 +500,26 @@ class CopyController:
             status_every_seconds=max(5, as_int(settings["status_every_seconds"], 20)),
         )
 
-    def publish_status(self) -> bool:
-        return self.card().update(self.store.job())
+    def adopt_status_card(self, chat_id: int, message_id: int) -> bool:
+        """Mark the currently pressed owner panel as the one active card.
+
+        This is what guarantees that button actions, setup replies, progress,
+        pause, errors, and completion all edit the same message instead of
+        creating a second card.
+        """
+        with self._lock:
+            if self.owner_id <= 0 or int(chat_id) != int(self.owner_id) or int(message_id) <= 0:
+                return False
+            job = self.store.job()
+            if str(job.get("status_chat_id") or "") == str(chat_id) and int(job.get("status_message_id") or 0) == int(message_id):
+                return True
+            job["status_chat_id"] = str(chat_id)
+            job["status_message_id"] = int(message_id)
+            self.store.save_job(job)
+            return True
+
+    def publish_status(self, allow_create: bool = True) -> bool:
+        return self.card().update(self.store.job(), allow_create=allow_create)
 
     def status_text(self) -> str:
         return StatusCard.text(self.store.job(), self.store.settings())
@@ -510,7 +550,7 @@ class CopyController:
                 job["note"] = ""
                 self.store.save_job(job)
 
-            self.card().update(job, title="📦 Channel copy starting")
+            self.card().update(job, title="📦 Channel copy starting", allow_create=False)
             self._worker = CopyWorker(self.api, self.store, config, self._on_finished)
             self._worker.start()
             return True, "Copy started. The live card in this private chat will update in place."
@@ -523,14 +563,14 @@ class CopyController:
                     job["status"] = "paused"
                     job["note"] = "No active worker remains. Tap Start / Resume to continue."
                     self.store.save_job(job)
-                self.publish_status()
+                self.publish_status(allow_create=False)
                 return False, "No active copy thread is running."
             self._worker.request_stop()
             job = self.store.job()
             job["status"] = "stopping"
             job["note"] = "Pause requested. Waiting for the current Telegram request to finish safely."
             self.store.save_job(job)
-            self.publish_status()
+            self.publish_status(allow_create=False)
             return True, "Pause requested. The status card will change to PAUSED when safe."
 
     @staticmethod
