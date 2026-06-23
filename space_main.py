@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hugging Face Docker Space entry point — Pyrogram MTProto version."""
+"""Hugging Face Docker Space entry point — multi-user Pyrogram MTProto bot."""
 from __future__ import annotations
 
 import asyncio
@@ -15,11 +15,10 @@ from pathlib import Path
 
 from pyrogram import Client
 
-from app.pyrogram_compat import apply_peer_id_compat
-
 from app.api import BotApi
 from app.bot import ControlBot
 from app.config import Settings
+from app.pyrogram_compat import apply_peer_id_compat
 from app.store import Store
 
 
@@ -30,9 +29,8 @@ class ServiceRunner:
         self.thread: threading.Thread | None = None
         self.loop: asyncio.AbstractEventLoop | None = None
         self.bot: ControlBot | None = None
-        self.client: Client | None = None
         self.ready = threading.Event()
-        self.failed: str = ""
+        self.failed = ""
 
     def start(self) -> None:
         self.thread = threading.Thread(target=self._thread_main, name="pyrogram-mtproto-bot", daemon=True)
@@ -43,13 +41,14 @@ class ServiceRunner:
             asyncio.run(self._run())
         except Exception as exc:  # noqa: BLE001
             self.failed = str(exc)
-            logging.getLogger(__name__).exception("Pyrogram MTProto service stopped: %s", exc)
+            logging.getLogger(__name__).exception("Pyrogram service stopped: %s", exc)
         finally:
             self.ready.set()
 
     async def _run(self) -> None:
-        self.loop = asyncio.get_running_loop()
-        self.client = Client(
+        loop = asyncio.get_running_loop()
+        self.loop = loop
+        client = Client(
             name=self.settings.session_name,
             api_id=self.settings.api_id,
             api_hash=self.settings.api_hash,
@@ -59,27 +58,29 @@ class ServiceRunner:
             sleep_threshold=90,
             no_updates=False,
         )
-        await self.client.start()
-        api = BotApi(self.client, self.loop)
+        await client.start()
+        api = BotApi(client, loop)
         self.bot = ControlBot(
-            client=self.client,
+            client=client,
             api=api,
             store=self.store,
             configured_owner_id=self.settings.owner_id,
-            auto_resume=self.settings.auto_resume,
+            allow_all_users=self.settings.allow_all_users,
+            max_active_jobs=self.settings.max_active_jobs,
             api_id_configured=bool(self.settings.api_id),
             api_hash_configured=bool(self.settings.api_hash),
+            force_sub_channel=self.settings.force_sub_channel,
         )
         self.ready.set()
         try:
             await self.bot.start()
         finally:
             api.close()
-            await self.client.stop()
+            await client.stop()
 
     def stop(self) -> None:
-        if self.loop and self.bot:
-            self.loop.call_soon_threadsafe(lambda: asyncio.create_task(self.bot.stop()))
+        if self.bot and self.loop and not self.loop.is_closed():
+            self.loop.call_soon_threadsafe(self.bot._stop.set)
 
     def alive(self) -> bool:
         return bool(self.thread and self.thread.is_alive())
@@ -91,65 +92,47 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         runner = self.runner
         alive = bool(runner and runner.alive())
-        status = 200 if alive else 503
-        body = {
-            "service": "telegram-channel-copier-pyrogram",
+        payload = json.dumps({
+            "service": "telegram-channel-copier-multiuser",
             "status": "running" if alive else "bot-worker-not-running",
             "ready": bool(runner and runner.ready.is_set()),
-            "error": runner.failed if runner else "runner not created",
+            "error": runner.failed if runner else "runner missing",
             "transport": "MTProto / Pyrogram",
-        }
-        data = json.dumps(body).encode("utf-8")
-        self.send_response(status)
+            "mode": "multi-user",
+        }).encode("utf-8")
+        self.send_response(200 if alive else 503)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
-        self.wfile.write(data)
+        self.wfile.write(payload)
 
     def log_message(self, fmt: str, *args: object) -> None:  # noqa: A003
         logging.getLogger("health").info("%s - %s", self.address_string(), fmt % args)
 
 
-# Sri Lanka has a fixed UTC+05:30 offset and no daylight-saving changes.
-# A custom formatter keeps container, Pyrogram, and copier logs in Sri Lankan time
-# even when the Hugging Face host itself runs in UTC.
 SRI_LANKA_TZ = timezone(timedelta(hours=5, minutes=30), name="SLST")
 
 
 class SriLankaFormatter(logging.Formatter):
-    """Render every logging record in Asia/Colombo time."""
-
     def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:  # noqa: N802
-        local_time = datetime.fromtimestamp(record.created, tz=SRI_LANKA_TZ)
-        if datefmt:
-            return local_time.strftime(datefmt)
-        return f"{local_time:%Y-%m-%d %H:%M:%S},{int(record.msecs):03d} SLST"
+        local = datetime.fromtimestamp(record.created, tz=SRI_LANKA_TZ)
+        return local.strftime(datefmt) if datefmt else f"{local:%Y-%m-%d %H:%M:%S},{int(record.msecs):03d} SLST"
 
 
 def configure_logging(level: str, data_dir: Path) -> None:
-    """Configure stdout and file logs in Sri Lankan Standard Time (UTC+05:30)."""
     data_dir.mkdir(parents=True, exist_ok=True)
-
-    # Also expose TZ for libraries that use the process-local clock directly.
     os.environ["TZ"] = "Asia/Colombo"
     if hasattr(time, "tzset"):
         time.tzset()
-
     formatter = SriLankaFormatter("%(asctime)s | %(levelname)-5s | %(name)s | %(message)s")
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
     try:
         handlers.append(logging.FileHandler(data_dir / "copier.log", encoding="utf-8"))
     except OSError:
         pass
-
     for handler in handlers:
         handler.setFormatter(formatter)
-
-    logging.basicConfig(
-        level=getattr(logging, level, logging.INFO),
-        handlers=handlers,
-        force=True,
-    )
+    logging.basicConfig(level=getattr(logging, level, logging.INFO), handlers=handlers, force=True)
 
 
 def main() -> int:
@@ -160,15 +143,13 @@ def main() -> int:
     store = Store(settings.data_dir / "channel_copier.sqlite3")
     runner = ServiceRunner(settings, store)
     runner.start()
-
     HealthHandler.runner = runner
-    port = int(os.environ.get("PORT", "7860"))
-    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
-    logger.info("Hugging Face Space health endpoint listening on port %s", port)
+    server = ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "7860"))), HealthHandler)
+    logger.info("Hugging Face Space health endpoint listening on port %s", os.environ.get("PORT", "7860"))
     logger.info("Data directory: %s", settings.data_dir)
     logger.info("Transport: Pyrogram MTProto. API_ID/API_HASH are required; Bot API HTTP is not used.")
-    logger.info("New private-channel ID compatibility: enabled.")
-
+    logger.info("Multi-user mode: %s | max active jobs: %s", "enabled" if settings.allow_all_users else "operator only", settings.max_active_jobs)
+    logger.info("Force subscription: %s.", "enabled" if settings.force_sub_channel else "disabled")
     try:
         server.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:

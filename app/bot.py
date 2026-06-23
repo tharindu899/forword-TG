@@ -1,10 +1,15 @@
-"""Owner-only compact inline control panel for the Pyrogram channel copier."""
+"""Multi-user private control panels.
+
+Every user can use the bot when ALLOW_ALL_USERS=true. Profiles, jobs, pending
+inputs, confirmations, and panel message IDs are keyed by Telegram user ID.
+"""
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import logging
 import re
+from html import escape
 from dataclasses import dataclass
 from typing import Any
 
@@ -13,7 +18,6 @@ from pyrogram.handlers import CallbackQueryHandler, MessageHandler
 from pyrogram.types import (
     BotCommand,
     BotCommandScopeAllPrivateChats,
-    BotCommandScopeChat,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -21,21 +25,22 @@ from pyrogram.types import (
 )
 
 from .api import BotApi
-from .copier import CopyController
 from .store import Store
+from .ui import main_keyboard, panel_text, speed_name
+from .workers import JobManager, StatusCard
 
 LOGGER = logging.getLogger(__name__)
 
-# Keep Telegram's visible slash-command menu small. Everything else is in buttons.
 MENU_COMMANDS: list[BotCommand] = [
-    BotCommand("start", "Open or refresh the panel"),
-    BotCommand("copy", "Start or resume copy"),
-    BotCommand("pause", "Pause safely"),
-    BotCommand("status", "Refresh progress"),
+    BotCommand("start", "Open a fresh private panel"),
+    BotCommand("help", "Show the compact command guide"),
+    BotCommand("copy", "Start or resume your copy"),
+    BotCommand("pause", "Pause your active task"),
+    BotCommand("status", "Refresh your own status"),
+    BotCommand("clean", "Clear source, target, or range"),
+    BotCommand("delete", "Delete one message or a range"),
 ]
-VISIBLE_COMMAND_NAMES = [item.command for item in MENU_COMMANDS]
-HIDDEN_COMMAND_NAMES = ["claim", "syncmenu"]
-ALL_COMMAND_NAMES = VISIBLE_COMMAND_NAMES + HIDDEN_COMMAND_NAMES
+COMMAND_NAMES = [item.command for item in MENU_COMMANDS]
 
 
 @dataclass
@@ -46,86 +51,94 @@ class PendingInput:
 
 @dataclass
 class PendingDelete:
-    """One reviewed delete action waiting for the final red confirmation tap."""
-
     role: str
     start_id: int
     end_id: int
     panel_id: int
+    mode: str
 
 
 class ControlBot:
-    """Runs one editable owner-PM card: setup, controls, and live progress."""
-
     def __init__(
         self,
         client: Client,
         api: BotApi,
         store: Store,
-        configured_owner_id: int,
-        auto_resume: bool,
         *,
-        api_id_configured: bool,
-        api_hash_configured: bool,
+        configured_owner_id: int = 0,
+        allow_all_users: bool = True,
+        max_active_jobs: int = 3,
+        api_id_configured: bool = True,
+        api_hash_configured: bool = True,
+        force_sub_channel: str = "",
     ) -> None:
         self.client = client
         self.api = api
         self.store = store
-        self.configured_owner_id = configured_owner_id if configured_owner_id > 0 else 0
-        self.auto_resume = auto_resume
+        self.configured_owner_id = int(configured_owner_id or 0)
+        self.allow_all_users = bool(allow_all_users)
         self.api_id_configured = api_id_configured
         self.api_hash_configured = api_hash_configured
-        if self.configured_owner_id:
-            self.store.set_owner_id(self.configured_owner_id)
-        self.controller = CopyController(api, store, self.owner_id())
-        self._stop = asyncio.Event()
-        self._menu_task: asyncio.Task[Any] | None = None
+        self.force_sub_channel = force_sub_channel.strip()
+        # FORCE_SUB_CHANNEL is the only setup value. The title is fetched
+        # from Telegram once at startup and falls back to the @username.
+        self.force_sub_title = self.force_sub_channel.lstrip("@") or "Update Channel"
+        self.force_sub_url = (
+            f"https://t.me/{self.force_sub_channel[1:]}" if self.force_sub_channel.startswith("@") else ""
+        )
+        self.manager = JobManager(api, store, max_active_jobs=max_active_jobs)
         self._pending: dict[int, PendingInput] = {}
         self._delete_pending: dict[int, PendingDelete] = {}
+        self._stop = asyncio.Event()
+        self._menu_task: asyncio.Task[Any] | None = None
 
-    def owner_id(self) -> int:
-        return self.configured_owner_id or self.store.get_owner_id()
+    async def _load_force_sub_title(self) -> None:
+        """Load the public channel display name from FORCE_SUB_CHANNEL.
+
+        The @username remains the fallback, so the gate still works even when
+        Telegram cannot resolve the title during startup.
+        """
+        if not self.force_sub_enabled:
+            return
+        try:
+            chat = await self.client.get_chat(self.force_sub_channel)
+            title = str(getattr(chat, "title", "") or "").strip()
+            if title:
+                self.force_sub_title = title
+                LOGGER.info("Force-subscription channel resolved: %s (%s).", title, self.force_sub_channel)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.info("Force-subscription title lookup skipped for %s: %s", self.force_sub_channel, exc)
+
+    def _force_sub_label(self) -> str:
+        title = escape(self.force_sub_title)
+        username = escape(self.force_sub_channel)
+        return f"<b>{title}</b> · <code>{username}</code>" if username else f"<b>{title}</b>"
+
+    def permitted(self, user_id: int) -> bool:
+        return self.allow_all_users or (self.configured_owner_id > 0 and int(user_id) == self.configured_owner_id)
 
     async def start(self) -> None:
-        self.client.add_handler(
-            MessageHandler(self.on_command, filters.private & filters.command(ALL_COMMAND_NAMES)),
-            group=0,
-        )
+        self.client.add_handler(MessageHandler(self.on_command, filters.private & filters.command(COMMAND_NAMES)), group=0)
         self.client.add_handler(CallbackQueryHandler(self.on_callback), group=0)
-        self.client.add_handler(
-            MessageHandler(
-                self.on_text_input,
-                filters.private & filters.text & ~filters.command(ALL_COMMAND_NAMES),
-            ),
-            group=1,
-        )
+        self.client.add_handler(MessageHandler(self.on_channel_post, filters.channel), group=0)
+        self.client.add_handler(MessageHandler(self.on_text_input, filters.private & filters.text & ~filters.command(COMMAND_NAMES)), group=1)
 
-        known_dialogs = await self.prime_peer_cache()
+        if self.configured_owner_id:
+            if self.store.migrate_legacy_owner(self.configured_owner_id):
+                LOGGER.info("Migrated the legacy single-user panel state for configured operator %s.", self.configured_owner_id)
+        recovered = self.store.recover_after_restart()
+        if recovered:
+            LOGGER.info("Marked %s interrupted user task(s) as paused after restart.", len(recovered))
+
         me = await self.client.get_me()
+        await self._load_force_sub_title()
         LOGGER.info("Connected via MTProto as @%s (id=%s)", me.username or "unknown", me.id)
-        LOGGER.info("Peer cache warmed from %s dialog(s); private channel IDs can now be resolved.", known_dialogs)
-        LOGGER.info("Bot transport: Pyrogram MTProto. One-message compact PM panel enabled.")
-        LOGGER.info(
-            "Secrets: BOT_TOKEN configured; OWNER_ID=%s; API_ID=%s; API_HASH=%s.",
-            "set" if self.owner_id() else "not set",
-            "set" if self.api_id_configured else "not set",
-            "set" if self.api_hash_configured else "not set",
-        )
-        self.queue_menu_sync(force=False)
-
-        job = self.store.recover_after_restart()
-        owner = self.owner_id()
-        self.controller.set_owner_id(owner)
-        if owner and self.auto_resume and job.get("interrupted"):
-            ok, text = await asyncio.to_thread(self.controller.start)
-            LOGGER.info("Auto-resume: %s", text)
-            if not ok:
-                # Auto-resume runs in the background after a Space restart.
-                # Never create a new PM card here; the owner can open /start.
-                await asyncio.to_thread(self.controller.publish_status, False)
-
+        LOGGER.info("Multi-user mode: %s; max active jobs=%s.", "enabled" if self.allow_all_users else "operator only", self.manager.max_active_jobs)
+        LOGGER.info("Force subscription: %s.", "enabled" if self.force_sub_enabled else "disabled")
+        LOGGER.info("Peer cache warm-up skipped: Telegram bots cannot use GetDialogs.")
+        LOGGER.info("Secrets: BOT_TOKEN configured; API_ID=%s; API_HASH=%s.", "set" if self.api_id_configured else "not set", "set" if self.api_hash_configured else "not set")
+        self._menu_task = asyncio.create_task(self._register_menu(), name="register-multiuser-menu")
         await self._stop.wait()
-        await asyncio.to_thread(self.controller.request_shutdown_pause)
         if self._menu_task:
             self._menu_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -134,874 +147,638 @@ class ControlBot:
     async def stop(self) -> None:
         self._stop.set()
 
-    async def prime_peer_cache(self) -> int:
-        """Fetch the bot's dialogs once so Pyrogram stores channel access hashes.
+    async def on_channel_post(self, _client: Client, message: Message) -> None:
+        chat = getattr(message, "chat", None)
+        if chat:
+            LOGGER.debug("Received channel update for %s.", getattr(chat, "id", "unknown"))
 
-        MTProto requires an access hash for private channels. A bot may be an
-        administrator already, but a fresh Hugging Face session has no local
-        peer cache until it receives that dialog information.
-        """
-        count = 0
-        try:
-            async for _dialog in self.client.get_dialogs(limit=100):
-                count += 1
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.warning("Could not warm peer cache from dialogs: %s", exc)
-        return count
-
-    # ------------------------------------------------------------------
-    # Telegram command-menu setup
-    # ------------------------------------------------------------------
-    def queue_menu_sync(self, *, force: bool) -> None:
-        if self._menu_task and not self._menu_task.done():
-            self._menu_task.cancel()
-        self._menu_task = asyncio.create_task(
-            self._register_menu_forever(force=force), name="register-compact-bot-menu"
-        )
-
-    async def _set_menu_for_scope(self, label: str, scope: Any | None, *, force: bool) -> tuple[bool, str]:
-        try:
-            if force:
-                if scope is None:
-                    await self.client.delete_bot_commands()
-                else:
-                    await self.client.delete_bot_commands(scope=scope)
-            if scope is None:
-                await self.client.set_bot_commands(MENU_COMMANDS)
-            else:
-                await self.client.set_bot_commands(MENU_COMMANDS, scope=scope)
-            return True, label
-        except Exception as exc:  # noqa: BLE001
-            return False, f"{label}: {exc}"
-
-    async def _register_menu_forever(self, *, force: bool) -> None:
+    async def _register_menu(self) -> None:
         delay = 5
         while not self._stop.is_set():
-            owner = self.owner_id()
-            scopes: list[tuple[str, Any | None]] = [
-                ("default", None),
-                ("all private chats", BotCommandScopeAllPrivateChats()),
-            ]
-            if owner > 0:
-                scopes.append(("owner private chat", BotCommandScopeChat(chat_id=owner)))
-
-            results = [await self._set_menu_for_scope(label, scope, force=force) for label, scope in scopes]
-            successful = [text for ok, text in results if ok]
-            failed = [text for ok, text in results if not ok]
-            if "all private chats" in successful or "owner private chat" in successful:
-                LOGGER.info(
-                    "Registered compact command menu (%s commands) in: %s.",
-                    len(MENU_COMMANDS), ", ".join(successful),
-                )
-                if failed:
-                    LOGGER.warning("Optional command-menu scope failure: %s", " | ".join(failed))
-                return
-
-            LOGGER.warning(
-                "Command-menu registration did not reach a private-chat scope: %s. Retrying in %ss.",
-                " | ".join(failed) or "unknown error", delay,
-            )
             try:
-                await asyncio.wait_for(self._stop.wait(), timeout=delay)
-            except asyncio.TimeoutError:
-                pass
-            delay = min(delay * 2, 60)
-            force = False
+                await self.client.set_bot_commands(MENU_COMMANDS)
+                await self.client.set_bot_commands(MENU_COMMANDS, scope=BotCommandScopeAllPrivateChats())
+                LOGGER.info("Registered multi-user command menu (%s commands) for private chats.", len(MENU_COMMANDS))
+                return
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("Command menu registration failed: %s. Retrying in %ss.", exc, delay)
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=delay)
+                except asyncio.TimeoutError:
+                    pass
+                delay = min(delay * 2, 60)
 
-    # ------------------------------------------------------------------
-    # Symbol-line visual helpers
-    # ------------------------------------------------------------------
     @staticmethod
-    def symbol_panel(title: str, rows: list[str], note: str = "") -> str:
-        """One compact style for every bot card: ▤ header + ├ / └ rows."""
-        content = list(rows)
-        if note:
-            content.append(f"💬 {note}")
-        if not content:
-            content.append("ℹ️ No details available")
-
+    def _symbol(title: str, rows: list[str]) -> str:
         lines = [f"▤ <b>{title}</b>"]
-        for index, row in enumerate(content):
-            branch = "└" if index == len(content) - 1 else "├"
-            lines.append(f"{branch} {row}")
+        for i, row in enumerate(rows or ["ℹ️ No details"]):
+            lines.append(("└" if i == len(rows) - 1 else "├") + " " + row)
         return "\n".join(lines)
 
     @staticmethod
-    def _short(value: str, limit: int = 22) -> str:
-        value = value or "not set"
-        return value if len(value) <= limit else value[: limit - 1] + "…"
+    def _parse_channel(raw: str) -> str:
+        """Accept -100 IDs, @usernames, and ordinary Telegram post links."""
+        value = raw.strip().rstrip("/")
+        compact = value.removeprefix("https://").removeprefix("http://")
+        if compact.startswith("t.me/"):
+            parts = [part for part in compact.split("/")[1:] if part]
+            # Private channel link: t.me/c/<internal_channel_id>/<message_id>
+            if len(parts) >= 3 and parts[0] == "c" and parts[1].isdigit():
+                return "-100" + parts[1]
+            # Public channel link: t.me/<username>/<message_id>
+            if len(parts) >= 2 and parts[0] not in {"c", "joinchat"} and not parts[0].startswith("+"):
+                return "@" + parts[0].lstrip("@")
+        if value.startswith("@") and len(value) > 1:
+            return value
+        if value.startswith("-100") and value[4:].isdigit():
+            return value
+        return ""
 
-    def speed_name(self) -> str:
-        s = self.store.settings()
-        batch = int(s.get("batch_size") or 25)
-        delay = float(s.get("delay_seconds") or 0.6)
-        if batch <= 12 or delay >= 0.8:
-            return "Safe"
-        if batch >= 40 or delay <= 0.4:
-            return "Fast"
-        return "Balanced"
+    @staticmethod
+    def _parse_id(raw: str) -> int | None:
+        text = raw.strip().rstrip("/")
+        if text.isdigit():
+            return int(text)
+        match = re.search(r"/(\d+)$", text)
+        return int(match.group(1)) if match else None
 
-    def setup_text(self, note: str = "") -> str:
-        s = self.store.settings()
+    @staticmethod
+    def _parse_range(raw: str) -> tuple[int, int] | None:
+        pieces = [part for part in re.split(r"[\s,\-]+", raw.strip()) if part]
+        if len(pieces) != 2 or not all(piece.isdigit() for piece in pieces):
+            return None
+        start, end = int(pieces[0]), int(pieces[1])
+        return (start, end) if start >= 1 and end >= start else None
+
+    async def _delete_user_message(self, message: Message) -> None:
+        with contextlib.suppress(Exception):
+            await message.delete()
+
+    async def _edit_direct(self, user_id: int, panel_id: int, text: str, markup: InlineKeyboardMarkup) -> bool:
+        """Edit only the user's currently bound panel card.
+
+        The bound panel ID changes when /start creates a fresh card. Old cards
+        remain untouched and cannot become the live task card again.
+        """
+        job = self.store.job(user_id)
+        current_panel_id = int(job.get("status_message_id") or 0)
+        current_chat_id = int(job.get("status_chat_id") or user_id)
+        if current_panel_id != int(panel_id) or current_chat_id != int(user_id):
+            LOGGER.debug("Skipped stale panel edit for user %s (message %s).", user_id, panel_id)
+            return False
+        try:
+            await self.client.edit_message_text(user_id, panel_id, text, reply_markup=markup, disable_web_page_preview=True)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            if "MESSAGE_NOT_MODIFIED" not in str(exc).upper():
+                LOGGER.debug("Panel edit for user %s skipped: %s", user_id, exc)
+            return False
+
+    @property
+    def force_sub_enabled(self) -> bool:
+        return bool(self.force_sub_channel)
+
+    async def _subscription_status(self, user_id: int) -> str:
+        """Return ok, not_joined, or error without leaking other user data."""
+        if not self.force_sub_enabled:
+            return "ok"
+        try:
+            member = await self.client.get_chat_member(self.force_sub_channel, user_id)
+            raw_status = str(getattr(member, "status", "")).lower()
+            if any(flag in raw_status for flag in ("left", "banned", "kicked")):
+                return "not_joined"
+            return "ok"
+        except Exception as exc:  # noqa: BLE001
+            detail = f"{type(exc).__name__}: {exc}".lower()
+            if any(token in detail for token in ("usernotparticipant", "not participant", "not a participant")):
+                return "not_joined"
+            LOGGER.warning("Force-subscription check failed for user %s: %s", user_id, exc)
+            return "error"
+
+    def subscription_text(self, status: str = "not_joined") -> str:
+        channel = self._force_sub_label()
+        rows = [
+            f"📢 Join {channel} to unlock the bot.",
+            "🔒 Your own channels and tasks stay private after access is verified.",
+            "✅ Join the channel, then press <b>Verify Access</b>.",
+        ]
+        if status == "error":
+            rows.insert(2, "⚠️ Verification is unavailable. Add this bot as an admin in the required channel.")
+        return self._symbol("CHAN RELAY", rows)
+
+    def subscription_keyboard(self) -> InlineKeyboardMarkup:
+        rows: list[list[InlineKeyboardButton]] = []
+        if self.force_sub_url:
+            rows.append([
+                InlineKeyboardButton("📢 Join Channel", url=self.force_sub_url),
+                InlineKeyboardButton("✅ Verify Access", callback_data="sub:check"),
+            ])
+        else:
+            rows.append([InlineKeyboardButton("✅ Verify Access", callback_data="sub:check")])
+        return InlineKeyboardMarkup(rows)
+
+    async def _show_subscription_gate(self, user_id: int, *, panel_id: int = 0, status: str = "not_joined") -> None:
+        text = self.subscription_text(status)
+        markup = self.subscription_keyboard()
+        if panel_id and await self._edit_direct(user_id, panel_id, text, markup):
+            return
+        job = self.store.job(user_id)
+        current_id = int(job.get("status_message_id") or 0)
+        if current_id and await self._edit_direct(user_id, current_id, text, markup):
+            return
+        try:
+            message = await self.client.send_message(user_id, text, reply_markup=markup, disable_web_page_preview=True)
+            self.store.bind_panel(user_id, user_id, int(message.id))
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Could not show subscription gate for user %s: %s", user_id, exc)
+
+    async def _subscription_allowed(self, user_id: int, *, panel_id: int = 0) -> bool:
+        status = await self._subscription_status(user_id)
+        if status == "ok":
+            return True
+        await self._show_subscription_gate(user_id, panel_id=panel_id, status=status)
+        return False
+
+    def welcome_text(self) -> str:
+        return self._symbol("CHAN RELAY", [
+            "👋 <b>Welcome to @ChanRelayBot.</b>",
+            "📦 Copy media and manage message ranges between channels.",
+            "🔒 Every user gets a private workspace and private live task card.",
+            "⚙️ Open your panel when you are ready.",
+        ])
+
+    def welcome_keyboard(self) -> InlineKeyboardMarkup:
+        rows = [[
+            InlineKeyboardButton("⚙️ Open Panel", callback_data="panel:main"),
+            InlineKeyboardButton("❓ Help", callback_data="help:open"),
+        ]]
+        return InlineKeyboardMarkup(rows)
+
+    def help_text(self) -> str:
+        return self._symbol("HELP", [
+            "🔒 Only your own setup and task are shown.",
+            "▶️ <code>/start</code>  New private panel",
+            "❓ <code>/help</code>  This guide",
+            "📦 <code>/copy</code>  Start a configured copy",
+            "⏸ <code>/pause</code>  Pause your own task",
+            "🔄 <code>/status</code>  Refresh your panel",
+            "🧹 <code>/clean</code>  Clear saved source, target, or range",
+            "🗑 <code>/delete</code>  Delete after confirmation",
+        ])
+
+    def help_keyboard(self) -> InlineKeyboardMarkup:
+        rows = [[InlineKeyboardButton("◀️ Back to Panel", callback_data="panel:main")]]
+        return InlineKeyboardMarkup(rows)
+
+    async def create_welcome(self, user_id: int) -> bool:
+        """Create one fresh panel and make it the only card that receives updates."""
+        self.store.ensure_user(user_id)
+        self._pending.pop(user_id, None)
+        self._delete_pending.pop(user_id, None)
+        try:
+            status = await self._subscription_status(user_id)
+            text = self.welcome_text() if status == "ok" else self.subscription_text(status)
+            markup = self.welcome_keyboard() if status == "ok" else self.subscription_keyboard()
+            message = await self.client.send_message(
+                user_id,
+                text,
+                reply_markup=markup,
+                disable_web_page_preview=True,
+            )
+            self.store.bind_panel(user_id, user_id, int(message.id))
+            return True
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Could not create fresh panel for user %s: %s", user_id, exc)
+            return False
+
+    async def ensure_main(self, user_id: int, *, force_create: bool = True, note: str = "") -> bool:
+        self.store.ensure_user(user_id)
+        job = self.store.job(user_id)
+        settings = self.store.settings(user_id)
+        text = panel_text(settings, job, note)
+        markup = main_keyboard(job)
+        message_id = int(job.get("status_message_id") or 0)
+        chat_id = str(job.get("status_chat_id") or user_id)
+        if message_id:
+            try:
+                await self.client.edit_message_text(int(chat_id), message_id, text, reply_markup=markup, disable_web_page_preview=True)
+                self.store.bind_panel(user_id, user_id, message_id)
+                return True
+            except Exception as exc:  # noqa: BLE001
+                if "MESSAGE_NOT_MODIFIED" in str(exc).upper():
+                    return True
+                LOGGER.debug("Stored panel unavailable for user %s: %s", user_id, exc)
+        if not force_create:
+            return False
+        try:
+            message = await self.client.send_message(user_id, text, reply_markup=markup, disable_web_page_preview=True)
+            self.store.bind_panel(user_id, user_id, int(message.id))
+            return True
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Could not create panel for user %s: %s", user_id, exc)
+            return False
+
+    async def _show(self, user_id: int, text: str, markup: InlineKeyboardMarkup) -> None:
+        await self.ensure_main(user_id, force_create=True)
+        job = self.store.job(user_id)
+        panel_id = int(job.get("status_message_id") or 0)
+        if panel_id:
+            await self._edit_direct(user_id, panel_id, text, markup)
+
+    async def _adopt_callback_panel(self, query: CallbackQuery) -> tuple[int, int] | None:
+        """Accept callbacks only from a user's newest bound panel.
+
+        This prevents an old card from being rebound and receiving the live
+        update stream after the user opened a fresh /start card.
+        """
+        if not query.from_user or not query.message:
+            return None
+        user_id = int(query.from_user.id)
+        if not self.permitted(user_id):
+            await query.answer("This bot is not available for this account.", show_alert=True)
+            return None
+        if int(query.message.chat.id) != user_id:
+            await query.answer("Open your own private panel first.", show_alert=True)
+            return None
+        self.store.ensure_user(user_id)
+        panel_id = int(query.message.id)
+        job = self.store.job(user_id)
+        current_panel_id = int(job.get("status_message_id") or 0)
+        current_chat_id = int(job.get("status_chat_id") or user_id)
+        if panel_id != current_panel_id or current_chat_id != user_id:
+            await query.answer("This is an old card. Send /start to open your latest panel.", show_alert=True)
+            return None
+        return user_id, panel_id
+
+    def setup_text(self, user_id: int, note: str = "") -> str:
+        s = self.store.settings(user_id)
         rows = [
             "⚙️ <b>SETUP</b>",
-            f"📥 Source  <code>{self._short(s['source_channel'], 28)}</code>",
-            f"📤 Target  <code>{self._short(s['target_channel'], 28)}</code>",
+            f"📥 Source  <code>{s['source_channel'] or 'not set'}</code>",
+            f"📤 Target  <code>{s['target_channel'] or 'not set'}</code>",
             f"🎯 Range  <code>{s['range_start']} → {s['range_end']}</code>",
-            f"⚡ Speed  <code>{self.speed_name()}</code>",
+            f"⚡ Speed  <code>{speed_name(s)}</code>",
         ]
-        return self.symbol_panel("CHANNEL COPIER", rows, note or "Tap a field, then send one value.")
-
-    def _clear_button(self) -> InlineKeyboardButton:
-        """Return exactly one bin button for the last chosen setup field.
-
-        After a source, target, or range is saved, the button becomes a direct
-        clear action for that one field. Before anything is chosen, it opens a
-        tiny selector. This keeps the setup panel compact and avoids three
-        permanent bin buttons.
-        """
-        field = self.store.get("last_clear_field", "").strip().lower()
-        settings = self.store.settings()
-        valid = {
-            "source": bool(settings.get("source_channel")),
-            "target": bool(settings.get("target_channel")),
-            "range": int(settings.get("range_end") or 0) >= int(settings.get("range_start") or 1),
-        }
-        if field in valid and valid[field]:
-            labels = {"source": "🗑 Source", "target": "🗑 Target", "range": "🗑 Range"}
-            return InlineKeyboardButton(labels[field], callback_data=f"clear:{field}")
-        return InlineKeyboardButton("🗑 Clear", callback_data="clear:choose")
+        if note:
+            rows.append(f"💬 {note}")
+        return self._symbol("CHANNEL COPIER", rows)
 
     @staticmethod
-    def _two_column_grid(buttons: list[InlineKeyboardButton]) -> list[list[InlineKeyboardButton]]:
-        """Arrange controls compactly: pairs first, odd final item full width."""
-        rows: list[list[InlineKeyboardButton]] = []
-        for index in range(0, len(buttons), 2):
-            rows.append(buttons[index:index + 2])
-        return rows
-
-    def setup_keyboard(self) -> InlineKeyboardMarkup:
-        """Compact two-column setup grid with a full-width Cancel exit."""
-        rows = self._two_column_grid([
-            InlineKeyboardButton("📥 Source", callback_data="input:source"),
-            InlineKeyboardButton("📤 Target", callback_data="input:target"),
-            InlineKeyboardButton("🎯 Range", callback_data="input:range"),
-            InlineKeyboardButton("🧪 Test", callback_data="input:test"),
-            InlineKeyboardButton("🗑 Delete Messages", callback_data="delete:choose"),
-            InlineKeyboardButton(f"⚡ {self.speed_name()}", callback_data="speed"),
-        ])
-        rows.append([self._clear_button()])
-        rows.append([InlineKeyboardButton("✕ Cancel", callback_data="cancel")])
-        return InlineKeyboardMarkup(rows)
-
-    def clear_choice_text(self) -> str:
-        settings = self.store.settings()
-        rows = [
-            f"📥 Source  <code>{self._short(settings['source_channel'], 28)}</code>",
-            f"📤 Target  <code>{self._short(settings['target_channel'], 28)}</code>",
-            f"🎯 Range  <code>{settings['range_start']} → {settings['range_end']}</code>",
-        ]
-        return self.symbol_panel(
-            "CLEAR SETUP",
-            rows,
-            "Choose one saved value to remove. The same panel stays in this chat.",
-        )
-
-    def clear_choice_keyboard(self) -> InlineKeyboardMarkup:
-        settings = self.store.settings()
-        choices: list[InlineKeyboardButton] = []
-        if settings.get("source_channel"):
-            choices.append(InlineKeyboardButton("🗑 Source", callback_data="clear:source"))
-        if settings.get("target_channel"):
-            choices.append(InlineKeyboardButton("🗑 Target", callback_data="clear:target"))
-        try:
-            has_range = int(settings.get("range_end") or 0) >= int(settings.get("range_start") or 1)
-        except ValueError:
-            has_range = False
-        if has_range:
-            choices.append(InlineKeyboardButton("🗑 Range", callback_data="clear:range"))
-
-        if not choices:
-            rows = [[InlineKeyboardButton("ℹ️ Nothing saved", callback_data="clear:back")]]
-        else:
-            rows = self._two_column_grid(choices)
-        rows.append([InlineKeyboardButton("✕ Cancel", callback_data="cancel")])
-        return InlineKeyboardMarkup(rows)
-
-    def speed_text(self) -> str:
-        return self.symbol_panel(
-            "COPY SPEED",
-            [
-                "⚖️ <b>Balanced</b>  recommended",
-                "🐢 Safe  •  slower and steadier",
-                "🚀 Fast  •  quicker, may hit limits",
-            ],
-            "Choose one speed preset below.",
-        )
-
-    @staticmethod
-    def speed_keyboard() -> InlineKeyboardMarkup:
+    def setup_keyboard() -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("🐢 Safe", callback_data="speed:safe"),
-                InlineKeyboardButton("⚖️ Balanced", callback_data="speed:balanced"),
-            ],
-            [InlineKeyboardButton("🚀 Fast", callback_data="speed:fast")],
-            [InlineKeyboardButton("✕ Cancel", callback_data="cancel")],
+            [InlineKeyboardButton("📥 Source", callback_data="input:source"), InlineKeyboardButton("📤 Target", callback_data="input:target")],
+            [InlineKeyboardButton("🎯 Range", callback_data="input:range"), InlineKeyboardButton("🧪 Test", callback_data="input:test")],
+            [InlineKeyboardButton("⚡ Speed", callback_data="speed:open"), InlineKeyboardButton("◀️ Back to Panel", callback_data="panel:main")],
         ])
 
     def input_text(self, action: str, error: str = "") -> str:
-        prompts = {
-            "source": ("SOURCE CHANNEL", "Send old channel ID, @username, or post link.", "<code>@old_channel_username</code>"),
-            "target": ("TARGET CHANNEL", "Send new channel ID or @username.", "<code>@new_channel_username</code>"),
-            "range": ("MESSAGE RANGE", "Send start and end message IDs.", "<code>1 2123</code>"),
-            "test": ("TEST FILE", "Send one file ID or Telegram post link.", "<code>181</code>"),
+        details = {
+            "source": ("SOURCE CHANNEL", "Reply with a private channel ID, @username, or Telegram post link."),
+            "target": ("TARGET CHANNEL", "Reply with a private channel ID, @username, or Telegram post link."),
+            "range": ("MESSAGE RANGE", "Reply with two IDs: <code>100 250</code>"),
+            "test": ("TEST MESSAGE", "Reply with one source media message ID or post link."),
         }
-        title, guidance, example = prompts[action]
-        note = error or f"Reply with one value  •  Example {example}"
-        return self.symbol_panel(title, [f"✍️ {guidance}"], note)
-
-    def input_keyboard(self) -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup([[InlineKeyboardButton("✕ Cancel", callback_data="input:cancel")]])
-
-    def delete_choice_text(self) -> str:
-        settings = self.store.settings()
-        rows = [
-            "⚠️ <b>Permanent action</b>  •  cannot be undone",
-            f"📥 Source  <code>{self._short(settings['source_channel'], 28)}</code>",
-            f"📤 Target  <code>{self._short(settings['target_channel'], 28)}</code>",
-            "🔒 Bot needs <b>Delete Messages</b> admin permission in the selected channel.",
-        ]
-        return self.symbol_panel("DELETE MESSAGES", rows, "Choose exactly one channel. You will review the range before deletion starts.")
-
-    def delete_choice_keyboard(self) -> InlineKeyboardMarkup:
-        settings = self.store.settings()
-        choices: list[InlineKeyboardButton] = []
-        if settings.get("source_channel"):
-            choices.append(InlineKeyboardButton("📥 Source", callback_data="delete:source"))
-        if settings.get("target_channel"):
-            choices.append(InlineKeyboardButton("📤 Target", callback_data="delete:target"))
-        rows = self._two_column_grid(choices) if choices else [
-            [InlineKeyboardButton("⚠️ Set a channel first", callback_data="delete:cancel")]
-        ]
-        rows.append([InlineKeyboardButton("✕ Cancel", callback_data="delete:cancel")])
-        return InlineKeyboardMarkup(rows)
-
-    def configured_copy_range(self) -> tuple[int, int] | None:
-        """Return the saved copy range when it is valid.
-
-        The delete flow deliberately treats this as a safe default. A custom
-        delete range is optional, but deletion is always bounded: when no
-        custom range is supplied, the currently configured copy range is used.
-        """
-        settings = self.store.settings()
-        start_id = self.parse_message_id(str(settings.get("range_start", "")))
-        end_id = self.parse_message_id(str(settings.get("range_end", "")))
-        if start_id and end_id and start_id >= 1 and end_id >= start_id:
-            return start_id, end_id
-        return None
-
-    def delete_options_text(self, role: str, error: str = "") -> str:
-        channel = self.store.settings().get(f"{role}_channel", "")
-        copy_range = self.configured_copy_range()
-        range_line = (
-            f"📌 Copy range  <code>{copy_range[0]:,} → {copy_range[1]:,}</code>"
-            if copy_range else
-            "📌 Copy range  <code>not set</code>"
-        )
-        rows = [
-            f"🧹 Channel  <b>{role.title()}</b>  <code>{self._short(channel, 28)}</code>",
-            "🎯 Custom delete range  <b>optional</b>",
-            range_line,
-            "⚠️ Deletion is permanent. A final confirmation is always required.",
-        ]
-        note = error or (
-            "Use the saved copy range, or set a custom delete range. "
-            "The bot never deletes an unbounded channel."
-        )
-        return self.symbol_panel("DELETE OPTIONS", rows, note)
-
-    def delete_options_keyboard(self, role: str) -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("🎯 Custom Range", callback_data=f"delete:range:{role}"),
-                InlineKeyboardButton("🗑 Use Copy Range", callback_data=f"delete:default:{role}"),
-            ],
-            [
-                InlineKeyboardButton("◀️ Back", callback_data="delete:choose"),
-                InlineKeyboardButton("✕ Cancel", callback_data="delete:cancel"),
-            ],
-        ])
-
-    def delete_range_text(self, role: str, error: str = "") -> str:
-        channel = self.store.settings().get(f"{role}_channel", "")
-        copy_range = self.configured_copy_range()
-        default_line = (
-            f"📌 Saved copy range  <code>{copy_range[0]:,} → {copy_range[1]:,}</code>"
-            if copy_range else
-            "📌 Saved copy range  <code>not set</code>"
-        )
-        rows = [
-            f"🧹 Channel  <b>{role.title()}</b>  <code>{self._short(channel, 28)}</code>",
-            default_line,
-            "✍️ Send <b>start</b> and <b>end</b> message IDs to override it.",
-        ]
-        return self.symbol_panel(
-            "CUSTOM DELETE RANGE",
-            rows,
-            error or "Optional. Use ◀️ Back to use the saved copy range instead.",
-        )
-
-    def delete_confirm_text(self, pending: PendingDelete) -> str:
-        total = pending.end_id - pending.start_id + 1
-        channel = self.store.settings().get(f"{pending.role}_channel", "")
-        rows = [
-            f"🧹 Channel  <b>{pending.role.title()}</b>  <code>{self._short(channel, 28)}</code>",
-            f"🎯 Range  <code>{pending.start_id:,} → {pending.end_id:,}</code>",
-            f"🧮 Total  <b>{total:,}</b> messages",
-            "⚠️ <b>This cannot be undone.</b>",
-        ]
-        return self.symbol_panel("CONFIRM DELETE", rows, "Press the red button only when this channel and range are correct.")
+        title, text = details[action]
+        rows = [f"📝 {text}"]
+        if error:
+            rows.append(error)
+        rows.append("✕ Cancel returns to Setup.")
+        return self._symbol(title, rows)
 
     @staticmethod
-    def delete_range_keyboard(role: str) -> InlineKeyboardMarkup:
+    def input_keyboard() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([[InlineKeyboardButton("✕ Cancel", callback_data="flow:cancel")]])
+
+    def clean_text(self) -> str:
+        return self._symbol("CLEAN SETTINGS", ["🧹 Choose only the saved field you want to clear.", "Your other settings stay unchanged."])
+
+    @staticmethod
+    def clean_keyboard() -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("◀️ Options", callback_data=f"delete:options:{role}"),
-                InlineKeyboardButton("✕ Cancel", callback_data="delete:cancel"),
-            ],
+            [InlineKeyboardButton("🗑 Source", callback_data="clean:ask:source"), InlineKeyboardButton("🗑 Target", callback_data="clean:ask:target")],
+            [InlineKeyboardButton("🗑 Range", callback_data="clean:ask:range")],
+            [InlineKeyboardButton("◀️ Back to Panel", callback_data="panel:main")],
+        ])
+
+    def clean_confirm_text(self, field: str) -> str:
+        name = {"source": "Source Channel", "target": "Target Channel", "range": "Message Range"}[field]
+        return self._symbol("CONFIRM CLEAN", [f"⚠️ Clear saved <b>{name}</b>?", "This resets only your own saved setting and task counters."])
+
+    @staticmethod
+    def clean_confirm_keyboard(field: str) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"🗑 Clear {field.title()}", callback_data=f"clean:confirm:{field}"), InlineKeyboardButton("✕ Cancel", callback_data="flow:cancel")],
+        ])
+
+    def delete_choice_text(self) -> str:
+        return self._symbol("DELETE MESSAGES", ["⚠️ Deletion is permanent.", "Choose one message or a bounded range. A final confirmation is required."])
+
+    @staticmethod
+    def delete_choice_keyboard() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 One Message", callback_data="delete:mode:message"), InlineKeyboardButton("🎯 Message Range", callback_data="delete:mode:range")],
+            [InlineKeyboardButton("◀️ Back to Panel", callback_data="panel:main")],
+        ])
+
+    def delete_channel_text(self, mode: str, user_id: int) -> str:
+        s = self.store.settings(user_id)
+        return self._symbol("DELETE CHANNEL", [
+            f"🗑 Mode  <code>{'One Message' if mode == 'message' else 'Message Range'}</code>",
+            f"📥 Source  <code>{s['source_channel'] or 'not set'}</code>",
+            f"📤 Target  <code>{s['target_channel'] or 'not set'}</code>",
+            "Choose exactly one channel.",
+        ])
+
+    def delete_channel_keyboard(self, mode: str, user_id: int) -> InlineKeyboardMarkup:
+        s = self.store.settings(user_id)
+        buttons: list[InlineKeyboardButton] = []
+        if s["source_channel"]:
+            buttons.append(InlineKeyboardButton("📥 Source", callback_data=f"delete:channel:{mode}:source"))
+        if s["target_channel"]:
+            buttons.append(InlineKeyboardButton("📤 Target", callback_data=f"delete:channel:{mode}:target"))
+        rows: list[list[InlineKeyboardButton]] = []
+        if len(buttons) >= 2:
+            rows.append(buttons[:2])
+        elif buttons:
+            rows.append([buttons[0]])
+        rows.append([InlineKeyboardButton("◀️ Back", callback_data="delete:open")])
+        return InlineKeyboardMarkup(rows)
+
+    def delete_input_text(self, mode: str, role: str, error: str = "") -> str:
+        prompt = "Reply with one message ID or post link." if mode == "message" else "Reply with two IDs: <code>100 250</code>."
+        rows = [f"🧹 Channel  <code>{role.title()}</code>", f"📝 {prompt}", "✕ Cancel returns to the panel."]
+        if error:
+            rows.insert(2, error)
+        return self._symbol("DELETE INPUT", rows)
+
+    @staticmethod
+    def delete_input_keyboard() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([[InlineKeyboardButton("✕ Cancel", callback_data="flow:cancel")]])
+
+    def delete_confirm_text(self, pending: PendingDelete, user_id: int) -> str:
+        s = self.store.settings(user_id)
+        channel = s.get(f"{pending.role}_channel", "")
+        total = pending.end_id - pending.start_id + 1
+        return self._symbol("CONFIRM DELETE", [
+            "⚠️ <b>Messages cannot be restored.</b>",
+            f"🧹 Channel  <code>{channel or 'not set'}</code>",
+            f"🎯 Range  <code>{pending.start_id:,} → {pending.end_id:,}</code>  •  <code>{total:,} IDs</code>",
+            "Press the red delete button only when this is correct.",
         ])
 
     @staticmethod
     def delete_confirm_keyboard() -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("🗑 CONFIRM DELETE", callback_data="delete:confirm")],
-            [
-                InlineKeyboardButton("◀️ Change", callback_data="delete:choose"),
-                InlineKeyboardButton("✕ Cancel", callback_data="delete:cancel"),
-            ],
-        ])
+        return InlineKeyboardMarkup([[InlineKeyboardButton("🗑 CONFIRM DELETE", callback_data="delete:confirm"), InlineKeyboardButton("✕ Cancel", callback_data="flow:cancel")]])
 
-    # ------------------------------------------------------------------
-    # Owner/auth and silent helpers
-    # ------------------------------------------------------------------
-    def is_owner(self, user_id: int) -> bool:
-        owner = self.owner_id()
-        return owner > 0 and user_id == owner
-
-    async def claim_if_needed(self, message: Message, command: str) -> bool:
-        if not message.from_user:
-            return False
-        user_id = int(message.from_user.id)
-        owner = self.owner_id()
-        if owner:
-            return user_id == owner
-        if command == "claim":
-            self.store.set_owner_id(user_id)
-            self.controller.set_owner_id(user_id)
-            self.queue_menu_sync(force=True)
-            await asyncio.to_thread(self.controller.publish_status)
-            return False
-        # A misconfigured owner is the only case where a separate reply is needed.
-        # It still uses the same compact branch style as every other bot card.
-        with contextlib.suppress(Exception):
-            await message.reply_text(
-                self.symbol_panel(
-                    "ACCESS REQUIRED",
-                    [
-                        "🔒 Set <code>OWNER_ID</code> in Space Secrets",
-                        "🔄 Restart the Space after saving it",
-                    ],
-                    "Or send <code>/claim</code> once from your owner account.",
-                ),
-                disable_web_page_preview=True,
-            )
-        return False
-
-    async def delete_user_message(self, message: Message) -> None:
-        """Best-effort cleanup of setup replies and typed commands in the owner PM."""
-        with contextlib.suppress(Exception):
-            await message.delete()
+    def speed_text(self) -> str:
+        return self._symbol("SPEED PROFILE", ["🐢 Safe: fewer flood waits", "⚡ Balanced: recommended", "🚀 Fast: more Telegram rate limits"])
 
     @staticmethod
-    def _message_not_modified(error: BaseException | str) -> bool:
-        detail = str(error).lower()
-        return "message_not_modified" in detail or "message is not modified" in detail or "not modified" in detail
+    def speed_keyboard() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🐢 Safe", callback_data="speed:set:safe"), InlineKeyboardButton("⚡ Balanced", callback_data="speed:set:balanced")],
+            [InlineKeyboardButton("🚀 Fast", callback_data="speed:set:fast")],
+            [InlineKeyboardButton("◀️ Back to Setup", callback_data="setup:open")],
+        ])
 
-    async def edit_panel(self, query: CallbackQuery, text: str, markup: InlineKeyboardMarkup) -> None:
-        try:
-            if query.message:
-                await query.message.edit_text(text, disable_web_page_preview=True, reply_markup=markup)
-                if query.from_user:
-                    await asyncio.to_thread(
-                        self.controller.adopt_status_card,
-                        int(query.from_user.id),
-                        int(query.message.id),
-                    )
-        except Exception as exc:  # noqa: BLE001
-            if not self._message_not_modified(exc):
-                LOGGER.warning("Could not edit compact panel: %s", exc)
-
-    async def edit_panel_by_id(
-        self,
-        chat_id: int,
-        message_id: int,
-        text: str,
-        markup: InlineKeyboardMarkup,
-    ) -> None:
-        try:
-            await self.client.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=text,
-                disable_web_page_preview=True,
-                reply_markup=markup,
-            )
-            await asyncio.to_thread(self.controller.adopt_status_card, chat_id, message_id)
-        except Exception as exc:  # noqa: BLE001
-            if not self._message_not_modified(exc):
-                LOGGER.warning("Could not edit compact panel by id: %s", exc)
-
-    async def set_status_note(self, note: str) -> None:
-        job = self.store.job()
-        job["note"] = note
-        self.store.save_job(job)
-        # A setup/copy action already has a visible panel. Do not create another card.
-        await asyncio.to_thread(self.controller.publish_status, False)
-
-    async def ensure_not_running(self, panel_id: int, owner_id: int) -> bool:
-        if await asyncio.to_thread(self.controller.worker_running):
-            await self.edit_panel_by_id(
-                owner_id,
-                panel_id,
-                self.setup_text("⏳ Pause the running task before changing setup."),
-                self.setup_keyboard(),
-            )
-            return False
-        return True
-
-    # ------------------------------------------------------------------
-    # Commands: no extra bot cards; existing control card updates in place.
-    # ------------------------------------------------------------------
     async def on_command(self, _client: Client, message: Message) -> None:
-        if not message.from_user or not message.text:
+        if not message.from_user:
             return
-        command, _args = self.parse_command(message.text)
-        if not await self.claim_if_needed(message, command):
+        user_id = int(message.from_user.id)
+        if not self.permitted(user_id):
+            return
+        command = (message.command[0] if message.command else "start").lower()
+        self.store.ensure_user(user_id)
+        await self._delete_user_message(message)
+        if command == "start":
+            await self.create_welcome(user_id)
+            return
+        if not await self._subscription_allowed(user_id):
+            return
+        if command == "help":
+            await self._show(user_id, self.help_text(), self.help_keyboard())
+            return
+        if command == "status":
+            await self.ensure_main(user_id, force_create=True)
+            return
+        if command == "copy":
+            ok, text = await asyncio.to_thread(self.manager.start_copy, user_id, resume=False)
+            if ok:
+                await self.ensure_main(user_id, note="✅ Copy started.")
+            else:
+                await self.ensure_main(user_id, note=f"⚠️ {text}")
+            return
+        if command == "pause":
+            ok, text = await asyncio.to_thread(self.manager.pause, user_id)
+            await self.ensure_main(user_id, note=("✅ " if ok else "⚠️ ") + text)
+            return
+        if command == "clean":
+            await self._show(user_id, self.clean_text(), self.clean_keyboard())
+            return
+        if command == "delete":
+            await self._show(user_id, self.delete_choice_text(), self.delete_choice_keyboard())
             return
 
-        if command == "start" or command == "status":
-            await asyncio.to_thread(self.controller.publish_status)
-        elif command == "copy":
-            await self.start_or_resume()
-        elif command == "pause":
-            await self.pause_job()
-        elif command == "syncmenu":
-            self.queue_menu_sync(force=True)
-            await self.set_status_note("🔄 Command menu refresh requested. Close and reopen this PM once the log confirms it.")
-        elif command == "claim":
-            await asyncio.to_thread(self.controller.publish_status)
-
-        await self.delete_user_message(message)
-
-    async def start_or_resume(self) -> tuple[bool, str]:
-        job = self.store.job()
-        if job.get("status") == "completed":
-            text = "✅ This range is complete. Open Setup and choose a new range."
-            await self.set_status_note(text)
-            return False, text
-        ok, text = await asyncio.to_thread(self.controller.start, False)
-        if not ok:
-            await self.set_status_note(f"⚠️ {text}")
-        return ok, text
-
-    async def pause_job(self) -> tuple[bool, str]:
-        ok, text = await asyncio.to_thread(self.controller.pause)
-        if not ok:
-            await self.set_status_note(f"⚠️ {text}")
-        return ok, text
-
-    # ------------------------------------------------------------------
-    # Inline callbacks and in-place reply prompts
-    # ------------------------------------------------------------------
     async def on_callback(self, _client: Client, query: CallbackQuery) -> None:
-        if not query.from_user:
+        adopted = await self._adopt_callback_panel(query)
+        if not adopted or not query.data:
             return
-        user_id = int(query.from_user.id)
-        if not self.is_owner(user_id):
-            await query.answer("Owner only.", show_alert=True)
+        user_id, panel_id = adopted
+        data = query.data
+        if data == "sub:check":
+            status = await self._subscription_status(user_id)
+            if status == "ok":
+                await query.answer("Access verified")
+                await self._edit_direct(user_id, panel_id, self.welcome_text(), self.welcome_keyboard())
+            else:
+                await query.answer("Join the channel first." if status == "not_joined" else "Verification is unavailable.", show_alert=True)
+                await self._edit_direct(user_id, panel_id, self.subscription_text(status), self.subscription_keyboard())
             return
-        data = query.data or ""
-        if query.message:
-            await asyncio.to_thread(self.controller.adopt_status_card, user_id, int(query.message.id))
-
-        # Global return / cancel: clears transient prompts only and edits the
-        # same control card back to the normal panel.
-        if data in {"cancel", "input:cancel", "delete:cancel"}:
+        if not await self._subscription_allowed(user_id, panel_id=panel_id):
+            await query.answer("Join the required channel first.", show_alert=True)
+            return
+        if data == "help:open":
+            await query.answer()
+            await self._edit_direct(user_id, panel_id, self.help_text(), self.help_keyboard())
+            return
+        if data == "panel:main" or data == "panel:refresh":
+            await query.answer()
+            await self.ensure_main(user_id, force_create=True)
+            return
+        if data == "setup:open":
+            if self.manager.running(user_id):
+                await query.answer("Pause the task before editing setup.", show_alert=True)
+                return
+            await query.answer()
+            await self._edit_direct(user_id, panel_id, self.setup_text(user_id), self.setup_keyboard())
+            return
+        if data == "task:copy":
+            ok, text = await asyncio.to_thread(self.manager.start_copy, user_id, resume=False)
+            await query.answer("Started" if ok else text[:160], show_alert=not ok)
+            await self.ensure_main(user_id, note=("✅ " if ok else "⚠️ ") + text)
+            return
+        if data == "task:resume":
+            ok, text = await asyncio.to_thread(self.manager.resume, user_id)
+            await query.answer("Resumed" if ok else text[:160], show_alert=not ok)
+            await self.ensure_main(user_id, note=("✅ " if ok else "⚠️ ") + text)
+            return
+        if data == "task:pause":
+            ok, text = await asyncio.to_thread(self.manager.pause, user_id)
+            await query.answer("Pausing" if ok else text[:160], show_alert=not ok)
+            await self.ensure_main(user_id, note=("✅ " if ok else "⚠️ ") + text)
+            return
+        if data == "flow:cancel":
             self._pending.pop(user_id, None)
             self._delete_pending.pop(user_id, None)
             await query.answer("Cancelled")
-            await self.edit_panel(query, self.setup_text("✕ Cancelled."), self.setup_keyboard())
+            await self.ensure_main(user_id, force_create=True)
             return
-        if data in {"status", "home"}:
-            await query.answer("Panel refreshed")
-            await asyncio.to_thread(self.controller.publish_status)
+        if data.startswith("input:"):
+            action = data.split(":", 1)[1]
+            if self.manager.running(user_id):
+                await query.answer("Pause the task before editing setup.", show_alert=True)
+                return
+            self._pending[user_id] = PendingInput(action=action, panel_id=panel_id)
+            await query.answer("Send one reply")
+            await self._edit_direct(user_id, panel_id, self.input_text(action), self.input_keyboard())
             return
-        if data == "setup":
+        if data == "speed:open":
             await query.answer()
-            await self.edit_panel(query, self.setup_text(), self.setup_keyboard())
+            await self._edit_direct(user_id, panel_id, self.speed_text(), self.speed_keyboard())
             return
-        if data == "speed":
-            if not query.message or not await self.ensure_not_running(int(query.message.id), user_id):
-                await query.answer("Pause the task before changing speed.", show_alert=True)
-                return
-            await query.answer()
-            await self.edit_panel(query, self.speed_text(), self.speed_keyboard())
+        if data.startswith("speed:set:"):
+            profile = data.rsplit(":", 1)[1]
+            profiles = {"safe": (10, 0.9), "balanced": (25, 0.6), "fast": (40, 0.35)}
+            batch, delay = profiles.get(profile, profiles["balanced"])
+            self.store.update_settings(user_id, {"batch_size": batch, "delay_seconds": delay})
+            await query.answer("Speed saved")
+            await self._edit_direct(user_id, panel_id, self.setup_text(user_id, f"✅ {profile.title()} speed saved."), self.setup_keyboard())
             return
-        if data.startswith("speed:"):
-            if await asyncio.to_thread(self.controller.worker_running):
-                await query.answer("Pause the task before changing speed.", show_alert=True)
-                return
-            preset = data.split(":", 1)[1]
-            await self.apply_speed_preset(preset)
-            await query.answer(f"{preset.title()} speed saved")
-            await self.edit_panel(query, self.setup_text(f"✅ {preset.title()} speed saved."), self.setup_keyboard())
-            return
-        if data == "start":
-            ok, text = await self.start_or_resume()
-            await query.answer("Task started" if ok else text[:180], show_alert=not ok)
-            return
-        if data == "pause":
-            ok, text = await self.pause_job()
-            await query.answer("Pause requested" if ok else text[:180], show_alert=not ok)
-            return
-        if data == "sync":
-            self.queue_menu_sync(force=True)
-            await query.answer("Menu refresh started")
-            return
-
-        # Clear setup values. No task may be active while values are changed.
-        if data == "clear:choose":
-            if not query.message:
-                await query.answer("Open Setup first.", show_alert=True)
-                return
-            if not await self.ensure_not_running(int(query.message.id), user_id):
-                await query.answer("Pause the task before clearing setup.", show_alert=True)
+        if data.startswith("clean:ask:"):
+            field = data.rsplit(":", 1)[1]
+            if field not in {"source", "target", "range"}:
+                await query.answer("Unknown field", show_alert=True)
                 return
             await query.answer()
-            await self.edit_panel(query, self.clear_choice_text(), self.clear_choice_keyboard())
+            await self._edit_direct(user_id, panel_id, self.clean_confirm_text(field), self.clean_confirm_keyboard(field))
             return
-        if data == "clear:back":
-            await query.answer()
-            await self.edit_panel(query, self.setup_text(), self.setup_keyboard())
+        if data.startswith("clean:confirm:"):
+            field = data.rsplit(":", 1)[1]
+            self.store.clear_field(user_id, field)
+            await query.answer("Cleared")
+            await self.ensure_main(user_id, note=f"✅ {field.title()} cleared.")
             return
-        if data.startswith("clear:"):
-            field = data.split(":", 1)[1]
-            if field not in {"source", "target", "range"} or not query.message:
-                await query.answer("Unknown clear action.", show_alert=True)
-                return
-            if not await self.ensure_not_running(int(query.message.id), user_id):
-                await query.answer("Pause the task before clearing setup.", show_alert=True)
-                return
-            self.clear_setup_field(field)
-            await query.answer(f"{field.title()} cleared")
-            await self.edit_panel(query, self.setup_text(f"🗑 {field.title()} cleared."), self.setup_keyboard())
-            return
-
-        # Delete workflow: selected channel -> optional custom range or saved copy range -> explicit red confirmation.
-        if data == "delete:choose":
-            if not query.message:
-                await query.answer("Open Setup first.", show_alert=True)
-                return
-            if not await self.ensure_not_running(int(query.message.id), user_id):
-                await query.answer("Pause the active task before deleting.", show_alert=True)
-                return
-            self._pending.pop(user_id, None)
-            self._delete_pending.pop(user_id, None)
-            await query.answer()
-            await self.edit_panel(query, self.delete_choice_text(), self.delete_choice_keyboard())
-            return
-        if data in {"delete:source", "delete:target"}:
-            if not query.message:
-                await query.answer("Open Setup first.", show_alert=True)
-                return
-            if not await self.ensure_not_running(int(query.message.id), user_id):
-                await query.answer("Pause the active task before deleting.", show_alert=True)
-                return
-            role = data.split(":", 1)[1]
-            self._delete_pending.pop(user_id, None)
-            await query.answer()
-            await self.edit_panel(query, self.delete_options_text(role), self.delete_options_keyboard(role))
-            return
-        if data.startswith("delete:options:"):
-            if not query.message:
-                await query.answer("Open Setup first.", show_alert=True)
-                return
-            role = data.split(":", 2)[2]
-            if role not in {"source", "target"}:
-                await query.answer("Unknown delete channel.", show_alert=True)
-                return
-            if not await self.ensure_not_running(int(query.message.id), user_id):
-                await query.answer("Pause the active task before deleting.", show_alert=True)
+        if data == "delete:open":
+            if self.manager.running(user_id):
+                await query.answer("Pause the task before deleting.", show_alert=True)
                 return
             self._delete_pending.pop(user_id, None)
             await query.answer()
-            await self.edit_panel(query, self.delete_options_text(role), self.delete_options_keyboard(role))
+            await self._edit_direct(user_id, panel_id, self.delete_choice_text(), self.delete_choice_keyboard())
             return
-        if data.startswith("delete:range:"):
-            if not query.message:
-                await query.answer("Open Setup first.", show_alert=True)
+        if data.startswith("delete:mode:"):
+            mode = data.rsplit(":", 1)[1]
+            if mode not in {"message", "range"}:
+                await query.answer("Unknown delete mode", show_alert=True)
                 return
-            role = data.split(":", 2)[2]
-            if role not in {"source", "target"}:
-                await query.answer("Unknown delete channel.", show_alert=True)
-                return
-            if not await self.ensure_not_running(int(query.message.id), user_id):
-                await query.answer("Pause the active task before deleting.", show_alert=True)
-                return
-            self._delete_pending.pop(user_id, None)
-            self._pending[user_id] = PendingInput(action=f"delete_range:{role}", panel_id=int(query.message.id))
-            await query.answer("Send a custom range")
-            await self.edit_panel(query, self.delete_range_text(role), self.delete_range_keyboard(role))
+            await query.answer()
+            await self._edit_direct(user_id, panel_id, self.delete_channel_text(mode, user_id), self.delete_channel_keyboard(mode, user_id))
             return
-        if data.startswith("delete:default:"):
-            if not query.message:
-                await query.answer("Open Setup first.", show_alert=True)
+        if data.startswith("delete:channel:"):
+            _, _, mode, role = data.split(":", 3)
+            if mode not in {"message", "range"} or role not in {"source", "target"}:
+                await query.answer("Unknown delete option", show_alert=True)
                 return
-            role = data.split(":", 2)[2]
-            if role not in {"source", "target"}:
-                await query.answer("Unknown delete channel.", show_alert=True)
+            if not self.store.settings(user_id).get(f"{role}_channel"):
+                await query.answer("That channel is not set.", show_alert=True)
                 return
-            if not await self.ensure_not_running(int(query.message.id), user_id):
-                await query.answer("Pause the active task before deleting.", show_alert=True)
-                return
-            configured_range = self.configured_copy_range()
-            if not configured_range:
-                await query.answer("Set a copy range or choose Custom Range.", show_alert=True)
-                await self.edit_panel(query, self.delete_options_text(role, "⚠️ No saved copy range. Set a custom delete range."), self.delete_options_keyboard(role))
-                return
-            start_id, end_id = configured_range
-            self._delete_pending[user_id] = PendingDelete(
-                role=role,
-                start_id=start_id,
-                end_id=end_id,
-                panel_id=int(query.message.id),
-            )
-            await query.answer("Using saved copy range")
-            await self.edit_panel(query, self.delete_confirm_text(self._delete_pending[user_id]), self.delete_confirm_keyboard())
+            self._pending[user_id] = PendingInput(action=f"delete:{mode}:{role}", panel_id=panel_id)
+            await query.answer("Send the ID or range")
+            await self._edit_direct(user_id, panel_id, self.delete_input_text(mode, role), self.delete_input_keyboard())
             return
         if data == "delete:confirm":
             pending = self._delete_pending.get(user_id)
-            if not pending or not query.message:
-                await query.answer("Delete confirmation expired. Choose the channel again.", show_alert=True)
-                await self.edit_panel(query, self.delete_choice_text(), self.delete_choice_keyboard())
+            if not pending:
+                await query.answer("Confirmation expired. Open /delete again.", show_alert=True)
+                await self.ensure_main(user_id, force_create=True)
                 return
-            if not await self.ensure_not_running(int(query.message.id), user_id):
-                await query.answer("Pause the active task before deleting.", show_alert=True)
-                return
-            ok, text = await asyncio.to_thread(
-                self.controller.start_delete, pending.role, pending.start_id, pending.end_id
-            )
+            ok, text = await asyncio.to_thread(self.manager.start_delete, user_id, pending.role, pending.start_id, pending.end_id)
             if ok:
                 self._delete_pending.pop(user_id, None)
-                await query.answer("Deletion started")
-            else:
-                await query.answer(text[:180], show_alert=True)
-                await self.edit_panel(query, self.delete_confirm_text(pending), self.delete_confirm_keyboard())
+            await query.answer("Deletion started" if ok else text[:160], show_alert=not ok)
+            await self.ensure_main(user_id, note=("✅ " if ok else "⚠️ ") + text)
             return
-
-        if data.startswith("input:"):
-            action = data.split(":", 1)[1]
-            await self.ask_for_input(query, action)
-            return
-
         await query.answer()
-
-    async def ask_for_input(self, query: CallbackQuery, action: str) -> None:
-        if action not in {"source", "target", "range", "test"} or not query.message or not query.from_user:
-            return
-        if not await self.ensure_not_running(int(query.message.id), int(query.from_user.id)):
-            await query.answer("Pause task before editing.", show_alert=True)
-            return
-        self._delete_pending.pop(int(query.from_user.id), None)
-        self._pending[int(query.from_user.id)] = PendingInput(action=action, panel_id=int(query.message.id))
-        await query.answer("Send one reply")
-        await self.edit_panel(query, self.input_text(action), self.input_keyboard())
 
     async def on_text_input(self, _client: Client, message: Message) -> None:
         if not message.from_user or not message.text or message.text.startswith("/"):
             return
         user_id = int(message.from_user.id)
-        if not self.is_owner(user_id):
+        if not self.permitted(user_id):
             return
         pending = self._pending.get(user_id)
         if not pending:
             return
-        # A reply is preferred. A plain message is also accepted for Android clients.
+        if not await self._subscription_allowed(user_id, panel_id=pending.panel_id):
+            await self._delete_user_message(message)
+            return
         if message.reply_to_message and int(message.reply_to_message.id) != pending.panel_id:
             return
         self._pending.pop(user_id, None)
-        if not await self.ensure_not_running(pending.panel_id, user_id):
-            await self.delete_user_message(message)
-            return
-        await self.apply_input(user_id, pending, message.text.strip())
-        await self.delete_user_message(message)
-
-    async def apply_input(self, user_id: int, pending: PendingInput, raw: str) -> None:
+        raw = message.text.strip()
+        await self._delete_user_message(message)
         action = pending.action
-        if action.startswith("delete_range:"):
-            role = action.split(":", 1)[1]
-            values = [self.parse_message_id(part) for part in re.split(r"[\s,\-]+", raw.strip()) if part]
-            if role not in {"source", "target"} or len(values) != 2 or not all(values) or int(values[0]) < 1 or int(values[1]) < int(values[0]):
-                await self.edit_panel_by_id(
-                    user_id, pending.panel_id,
-                    self.delete_range_text(role if role in {"source", "target"} else "source", "⚠️ Use two IDs: 100 250"),
-                    self.delete_range_keyboard(role if role in {"source", "target"} else "source"),
-                )
-                self._pending[user_id] = pending
-                return
-            start_id, end_id = int(values[0]), int(values[1])
-            self._delete_pending[user_id] = PendingDelete(
-                role=role,
-                start_id=start_id,
-                end_id=end_id,
-                panel_id=pending.panel_id,
-            )
-            await self.edit_panel_by_id(
-                user_id, pending.panel_id,
-                self.delete_confirm_text(self._delete_pending[user_id]),
-                self.delete_confirm_keyboard(),
-            )
-            return
-
         if action in {"source", "target"}:
-            value = self.parse_channel_reference(raw)
+            value = self._parse_channel(raw)
             if not value:
-                await self.edit_panel_by_id(
-                    user_id, pending.panel_id,
-                    self.input_text(action, "⚠️ Invalid value. Send -100…, @channel, or t.me link."),
-                    self.input_keyboard(),
-                )
                 self._pending[user_id] = pending
+                await self._edit_direct(user_id, pending.panel_id, self.input_text(action, "⚠️ Send a valid ID, @username, or post link."), self.input_keyboard())
                 return
-            self.store.set("source_channel" if action == "source" else "target_channel", value)
-            self.store.set("last_clear_field", action)
-            await self.reset_for_changed_range()
-            label = "source" if action == "source" else "target"
-            await self.edit_panel_by_id(
-                user_id, pending.panel_id,
-                self.setup_text(f"✅ {label.title()} saved."),
-                self.setup_keyboard(),
-            )
+            self.store.set(user_id, f"{action}_channel", value)
+            s = self.store.settings(user_id)
+            self.store.reset_job(user_id, int(s["range_start"]), int(s["range_end"]))
+            await self._edit_direct(user_id, pending.panel_id, self.setup_text(user_id, f"✅ {action.title()} saved."), self.setup_keyboard())
             return
-
         if action == "range":
-            values = [self.parse_message_id(part) for part in re.split(r"[\s,\-]+", raw.strip()) if part]
-            if len(values) != 2 or not all(values) or int(values[0]) < 1 or int(values[1]) < int(values[0]):
-                await self.edit_panel_by_id(
-                    user_id, pending.panel_id,
-                    self.input_text("range", "⚠️ Use two IDs: 1 2123"),
-                    self.input_keyboard(),
-                )
+            parsed = self._parse_range(raw)
+            if not parsed:
                 self._pending[user_id] = pending
+                await self._edit_direct(user_id, pending.panel_id, self.input_text("range", "⚠️ Use two IDs: 100 250"), self.input_keyboard())
                 return
-            start_id, end_id = int(values[0]), int(values[1])
-            self.store.set("range_start", start_id)
-            self.store.set("range_end", end_id)
-            self.store.set("last_clear_field", "range")
-            self.store.reset_job(start_id, end_id)
-            await self.edit_panel_by_id(
-                user_id, pending.panel_id,
-                self.setup_text(f"✅ Range saved: <code>{start_id:,} → {end_id:,}</code>"),
-                self.setup_keyboard(),
-            )
+            start, end = parsed
+            self.store.update_settings(user_id, {"range_start": start, "range_end": end})
+            self.store.reset_job(user_id, start, end)
+            await self._edit_direct(user_id, pending.panel_id, self.setup_text(user_id, f"✅ Range saved: <code>{start:,} → {end:,}</code>"), self.setup_keyboard())
             return
-
         if action == "test":
-            msg_id = self.parse_message_id(raw)
-            if not msg_id:
-                await self.edit_panel_by_id(
-                    user_id, pending.panel_id,
-                    self.input_text("test", "⚠️ Send one message ID or post link."),
-                    self.input_keyboard(),
-                )
+            message_id = self._parse_id(raw)
+            if not message_id:
                 self._pending[user_id] = pending
+                await self._edit_direct(user_id, pending.panel_id, self.input_text("test", "⚠️ Send one valid message ID."), self.input_keyboard())
                 return
-            _ok, text = await asyncio.to_thread(self.controller.test_copy, msg_id)
-            await self.edit_panel_by_id(user_id, pending.panel_id, self.setup_text(text), self.setup_keyboard())
-
-    async def apply_speed_preset(self, preset: str) -> None:
-        presets = {
-            "safe": {"batch_size": 10, "delay_seconds": "0.90", "individual_delay_seconds": "0.18"},
-            "balanced": {"batch_size": 25, "delay_seconds": "0.60", "individual_delay_seconds": "0.12"},
-            "fast": {"batch_size": 50, "delay_seconds": "0.40", "individual_delay_seconds": "0.08"},
-        }
-        for key, value in presets.get(preset, presets["balanced"]).items():
-            self.store.set(key, value)
-
-    async def reset_for_changed_range(self) -> None:
-        s = self.store.settings()
-        start = self.parse_message_id(s["range_start"])
-        end = self.parse_message_id(s["range_end"])
-        if start and end and end >= start:
-            self.store.reset_job(start, end)
-
-    def clear_setup_field(self, field: str) -> None:
-        """Clear one reusable setup value and reset the saved job safely.
-
-        A finished or paused migration must never be resumed with an old
-        source/target/range after the user changes it. Resetting the job keeps
-        the existing one-message control card, but removes old counters and
-        starts the next migration from a clean idle state.
-        """
-        settings = self.store.settings()
-        if field == "source":
-            self.store.set("source_channel", "")
-            start = self.parse_message_id(settings["range_start"]) or 1
-            end = self.parse_message_id(settings["range_end"]) or 0
-        elif field == "target":
-            self.store.set("target_channel", "")
-            start = self.parse_message_id(settings["range_start"]) or 1
-            end = self.parse_message_id(settings["range_end"]) or 0
-        elif field == "range":
-            self.store.set("range_start", 1)
-            self.store.set("range_end", 0)
-            start, end = 1, 0
-        else:
-            raise ValueError(f"Unknown setup field: {field}")
-
-        self.store.set("last_clear_field", "")
-        self.store.reset_job(start, end)
-
-    # ------------------------------------------------------------------
-    # Parsing
-    # ------------------------------------------------------------------
-    @staticmethod
-    def parse_command(text: str) -> tuple[str, list[str]]:
-        parts = text.split()
-        if not parts:
-            return "", []
-        return parts[0].split("@", 1)[0].lower().lstrip("/"), parts[1:]
-
-    @staticmethod
-    def parse_message_id(value: str) -> int | None:
-        token = value.strip().rstrip("/")
-        if token.isdigit():
-            return int(token)
-        match = re.search(r"/(\d+)$", token)
-        return int(match.group(1)) if match else None
-
-    @staticmethod
-    def parse_channel_reference(value: str) -> str | None:
-        token = value.strip().rstrip("/")
-        if token.startswith("-100") and token[4:].isdigit():
-            return token
-        if token.startswith("@") and re.fullmatch(r"@[A-Za-z0-9_]+", token):
-            return token
-        private = re.search(r"(?:https?://)?t\.me/c/(\d+)(?:/\d+)?$", token, re.I)
-        if private:
-            return f"-100{private.group(1)}"
-        public = re.search(r"(?:https?://)?t\.me/([A-Za-z0-9_]+)(?:/\d+)?$", token, re.I)
-        if public:
-            return f"@{public.group(1)}"
-        return None
+            s = self.store.settings(user_id)
+            if not s["source_channel"] or not s["target_channel"]:
+                await self._edit_direct(user_id, pending.panel_id, self.setup_text(user_id, "⚠️ Set Source and Target before testing."), self.setup_keyboard())
+                return
+            ok, data = await asyncio.to_thread(self.api.copy_message, s["target_channel"], s["source_channel"], message_id, lambda: False)
+            note = "✅ Test copied without source attribution." if ok else f"❌ Test failed: {data.get('description', 'Unknown error')}"
+            await self._edit_direct(user_id, pending.panel_id, self.setup_text(user_id, note), self.setup_keyboard())
+            return
+        if action.startswith("delete:"):
+            _, mode, role = action.split(":", 2)
+            if mode == "message":
+                message_id = self._parse_id(raw)
+                if not message_id:
+                    self._pending[user_id] = pending
+                    await self._edit_direct(user_id, pending.panel_id, self.delete_input_text(mode, role, "⚠️ Send one valid message ID."), self.delete_input_keyboard())
+                    return
+                pending_delete = PendingDelete(role, message_id, message_id, pending.panel_id, mode)
+            else:
+                parsed = self._parse_range(raw)
+                if not parsed:
+                    self._pending[user_id] = pending
+                    await self._edit_direct(user_id, pending.panel_id, self.delete_input_text(mode, role, "⚠️ Use two IDs: 100 250"), self.delete_input_keyboard())
+                    return
+                pending_delete = PendingDelete(role, parsed[0], parsed[1], pending.panel_id, mode)
+            self._delete_pending[user_id] = pending_delete
+            await self._edit_direct(user_id, pending.panel_id, self.delete_confirm_text(pending_delete, user_id), self.delete_confirm_keyboard())
